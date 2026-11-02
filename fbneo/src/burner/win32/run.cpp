@@ -1,0 +1,1010 @@
+// Run module
+#include "burner.h"
+#include "dn.h"	// dn:
+
+int bRunPause = 0;
+int bAltPause = 0;
+
+int bAlwaysDrawFrames = 0;
+
+static bool bShowFPS = false;
+static unsigned int nDoFPS = 0;
+
+static bool bMute = false;
+static int nOldAudVolume;
+
+int kNetGame = 0;							// Non-zero if Kaillera is being used
+
+#ifdef FBNEO_DEBUG
+int counter;								// General purpose variable used when debugging
+#endif
+
+static unsigned int nNormalLast = 0;		// Last value of timeGetTime()
+static int nNormalFrac = 0;					// Extra fraction we did
+
+static bool bAppDoStep = 0;
+static bool bAppDoFast = 0;
+static bool bAppDoFasttoggled = 0;
+static bool bAppDoRewind = 0;
+
+static int nFastSpeed = 6;
+static void DisplayFPSInit(); // forward
+
+// in FFWD, the avi-writer still needs to write all frames (skipped or not)
+#define FFWD_GHOST_FRAME 0x8000
+
+// SlowMo T.A. feature
+int nSlowMo = 0;
+static int flippy = 0; // free running RunFrame() counter
+
+// For System Macros (below)
+static int prevPause = 0, prevFFWD = 0, prevFrame = 0, prevSState = 0, prevLState = 0, prevNState = 0, prevPState = 0, prevUState = 0;
+UINT32 prevPause_debounce = 0;
+
+struct lua_hotkey_handler {
+	UINT8 * macroSystemLuaHotkey_ref;
+	UINT8 macroSystemLuaHotkey_val;
+	int prev_value;
+	char *hotkey_name;
+};
+
+struct lua_hotkey_handler hotkey_debounces[] = {
+	{ &macroSystemLuaHotkey1, macroSystemLuaHotkey1, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey2, macroSystemLuaHotkey2, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey3, macroSystemLuaHotkey3, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey4, macroSystemLuaHotkey4, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey5, macroSystemLuaHotkey5, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey6, macroSystemLuaHotkey6, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey7, macroSystemLuaHotkey7, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey8, macroSystemLuaHotkey8, 0, "lua_hotkey" },
+	{ &macroSystemLuaHotkey9, macroSystemLuaHotkey9, 0, "lua_hotkey" },
+	{ NULL, 0, 0, NULL }
+};
+
+bool EmulatorAppIsFast() {
+	return bAppDoFast;
+}
+
+void EmulatorAppDoFast(bool dofast) {
+	bAppDoFast = dofast;
+	bAppDoFasttoggled = 0;
+}
+
+static void CheckSystemMacros() // These are the Pause / FFWD macros added to the input dialog
+{
+	// Pause
+	if (macroSystemPause && macroSystemPause != prevPause && timeGetTime() > prevPause_debounce+90) {
+		if (bHasFocus) {
+			PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_PAUSE, 1), 0);
+			prevPause_debounce = timeGetTime();
+		}
+	}
+	prevPause = macroSystemPause;
+
+	if (!kNetGame) {
+		// FFWD
+		int bPrevAppDoFast = bAppDoFast;
+		if (macroSystemFFWD) {
+			bAppDoFast = 1; prevFFWD = 1;
+			if (!bPrevAppDoFast) DisplayFPSInit(); // resync fps display
+		} else if (prevFFWD) {
+			bAppDoFast = 0; prevFFWD = 0;
+			if (bPrevAppDoFast) DisplayFPSInit(); // resync fps display
+		}
+
+		// Frame
+		if (macroSystemFrame) {
+			bRunPause = 1;
+			if (!prevFrame) {
+				bAppDoStep = 1;
+				prevFrame = 1;
+			}
+		} else {
+			prevFrame = 0;
+		}
+
+		// SlowMo
+		int slow = macroSystemSlowMo[0] * 1 + macroSystemSlowMo[1] * 2 + macroSystemSlowMo[2] * 3 + macroSystemSlowMo[3] * 4 + macroSystemSlowMo[4] * 5;
+		if (slow) {
+			slow -= 1;
+			if (slow >= 0 && slow <= 4) {
+				nSlowMo = slow;
+				MenuUpdateSlowMo();
+			}
+		}
+
+		// Rewind handled in RunFrame()!
+
+		for (int hotkey_num = 0; hotkey_debounces[hotkey_num].macroSystemLuaHotkey_ref != NULL; hotkey_num++) {
+			// Use the reference to the hotkey variable in order to update our stored value
+			// Because the hotkeys are hard coded into variables this allows us to iterate on them
+			hotkey_debounces[hotkey_num].macroSystemLuaHotkey_val = *hotkey_debounces[hotkey_num].macroSystemLuaHotkey_ref;
+			if (
+				hotkey_debounces[hotkey_num].macroSystemLuaHotkey_val &&
+				hotkey_debounces[hotkey_num].macroSystemLuaHotkey_val != hotkey_debounces[hotkey_num].prev_value
+			) {
+				CallRegisteredLuaFunctions((LuaCallID)(LUACALL_HOTKEY_1 + hotkey_num));
+			}
+			hotkey_debounces[hotkey_num].prev_value = hotkey_debounces[hotkey_num].macroSystemLuaHotkey_val;
+		}
+
+	}
+	// Load State
+	if (macroSystemLoadState && macroSystemLoadState != prevLState) {
+		PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_STATE_LOAD_SLOT, 1), 0);
+	}
+	prevLState = macroSystemLoadState;
+	// Save State
+	if (macroSystemSaveState && macroSystemSaveState != prevSState) {
+		PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_STATE_SAVE_SLOT, 1), 0);
+	}
+	prevSState = macroSystemSaveState;
+	// Next State
+	if (macroSystemNextState && macroSystemNextState != prevNState) {
+		PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_STATE_NEXTSLOT, 1), 0);
+	}
+	prevNState = macroSystemNextState;
+	// Previous State
+	if (macroSystemPreviousState && macroSystemPreviousState != prevPState) {
+		PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_STATE_PREVSLOT, 1), 0);
+	}
+	prevPState = macroSystemPreviousState;
+	// UNDO State
+	if (macroSystemUNDOState && macroSystemUNDOState != prevUState) {
+		scrnSSUndo();
+	}
+	prevUState = macroSystemUNDOState;
+}
+
+static int GetInput(bool bCopy)
+{
+	static unsigned int i = 0;
+	InputMake(bCopy); 						// get input
+
+	CheckSystemMacros();
+
+	// Update Input dialog every 3rd frame
+	if ((i%3) == 0) {
+		InpdUpdate();
+	}
+
+	// Update Input Set dialog
+	InpsUpdate();
+	return 0;
+}
+
+static LARGE_INTEGER qpcFreq, qpcLast;
+static UINT32 nLastEmu;
+
+static void DisplayFPSInit()
+{
+	nDoFPS = 0;
+	QueryPerformanceFrequency(&qpcFreq);
+	QueryPerformanceCounter(&qpcLast);
+	nLastEmu = nFramesEmulated;
+}
+
+static void DisplayFPS()
+{
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	double dt = (double)(now.QuadPart - qpcLast.QuadPart) / qpcFreq.QuadPart;
+	if (dt < 1.0) return; // update once per second
+
+	double fps = (nFramesEmulated - nLastEmu) / dt;
+
+	TCHAR s[32];
+	_sntprintf(s, 32, _T("%2.2lf"), fps);
+	VidSNewShortMsg(s, 0xDFDFFF, 480, 0);
+
+	qpcLast = now;
+	nLastEmu = nFramesEmulated;
+}
+
+static void DisplayFPSCheckState()
+{
+	static int bLastFast = -1, bLastPause = -1;
+	static LONGLONG nLastCall = 0;
+	static int timer = 0;
+
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+
+	// frame normally runs every ~16.67ms (at 60hz)
+	// a gap over 100ms means something blocked the loop: menu, window drag, dialog, loading...
+	const bool bStalled = nLastCall && qpcFreq.QuadPart &&
+	                      (now.QuadPart - nLastCall) > qpcFreq.QuadPart / 10;
+	nLastCall = now.QuadPart;
+
+	if (bStalled || bAppDoFast != bLastFast || bRunPause != bLastPause) {
+		timer = 30;
+		bLastFast  = bAppDoFast;
+		bLastPause = bRunPause;
+	}
+	if (timer > 0) {
+		// it takes a few frames to stabilize...
+		timer--;
+		DisplayFPSInit();
+	}
+}
+
+// define this function somewhere above RunMessageLoop()
+void ToggleLayer(unsigned char thisLayer)
+{
+	nBurnLayer ^= thisLayer;				// xor with thisLayer
+	VidRedraw();
+	VidPaint(0);
+}
+
+#ifdef FBNEO_DEBUG
+void do_shonky_profile()
+{
+	bShonkyProfileMode = false; // run once!
+	pBurnDraw = NULL; //pVidImage;
+
+	const int total_frames = 5000;
+	unsigned int start_time = timeGetTime();
+
+	for (int i = 0; i < total_frames; i++) {
+		BurnDrvFrame();
+	}
+	unsigned int end_time = timeGetTime();
+
+	unsigned int total_time = end_time - start_time;
+	float total_seconds = (float)total_time / 1000.0;
+
+	bprintf(0, _T("shonky profile mode %d\n"), total_frames);
+	bprintf(0, _T("shonky profile:  %d frames,  %dms,  %dfps\n"), total_frames, total_time, (int)(total_frames / total_seconds));
+}
+#endif
+
+// Present pacing when no video sync is active.
+// Frames are produced when the audio engine signals a free segment, which happens on
+// its own period (~10ms on Vista+), so frame times alternate e.g. 20/20/10ms.
+// Presents are held back to a steady QPC schedule which follows the audio clock.
+static LARGE_INTEGER qpcPaceFreq;
+static LONGLONG nPaceNext = 0;
+
+static bool RunPaceActive()
+{
+	if (bDnNet) return true;	// dn: the vblank wait doesn't even out the audio's 20/20/10 ms on a fast monitor (165 Hz: a vblank every 6 ms)
+	if (bVidVSync || (bVidDWMSync && !nVidFullscreen)) return false;
+	if (bAppDoFast || kNetGame) return false;
+
+	return true;
+}
+
+static void RunPacePresent()
+{
+	if (!RunPaceActive()) {
+		nPaceNext = 0;
+		return;
+	}
+
+	if (qpcPaceFreq.QuadPart == 0) {
+		QueryPerformanceFrequency(&qpcPaceFreq);
+	}
+
+	LONGLONG nPeriod;
+	if (bAudPlaying && nBurnSoundRate > 0 && nBurnSoundLen > 0) {
+		nPeriod = qpcPaceFreq.QuadPart * nBurnSoundLen / nBurnSoundRate;
+	} else {
+		nPeriod = qpcPaceFreq.QuadPart * 100 / nAppVirtualFps;
+	}
+
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+
+	LONGLONG nLead = nPaceNext - now.QuadPart;
+	if (nPaceNext == 0 || nLead < 0) {
+		// late (or first frame): present now, the schedule follows
+		nPaceNext = now.QuadPart;
+	} else if (nLead > nPeriod) {
+		// schedule drifted ahead of the frame source, pull it back
+		nPaceNext = now.QuadPart + nPeriod;
+	}
+
+	const LONGLONG nSleepMargin = qpcPaceFreq.QuadPart * 2 / 1000;
+	for (;;) {
+		QueryPerformanceCounter(&now);
+		LONGLONG nRemain = nPaceNext - now.QuadPart;
+		if (nRemain <= 0) break;
+		Sleep((bEnableHighResTimer && nRemain > nSleepMargin) ? 1 : 0);
+	}
+
+	nPaceNext += nPeriod;
+}
+
+// With or without sound, run one frame.
+// If bDraw is true, it's the last frame before we are up to date, and so we should draw the screen
+int RunFrame(int bDraw, int bPause)
+{
+	static int bPrevPause = 0;
+	static int bPrevDraw = 0;
+
+	if (bShowFPS) DisplayFPSCheckState();
+
+	if (bPrevDraw && !bPause) {
+		if (!bDnNet) {							// dn: netplay paints right after the frame instead (end of RunFrame)
+			RunPacePresent();
+			VidPaint(0);						// paint the screen (no need to validate)
+		}
+
+		if (!nVidFullscreen && bVidDWMSync)     // Sync to DWM (Win7+, windowed)
+			SuperWaitVBlank();
+	}
+
+	flippy++;
+	if (nSlowMo) { // SlowMo T.A.
+		if (nSlowMo == 1) {	if ((flippy % 4) == 0) return 0; } // 75% speed
+		else if ((flippy % ((nSlowMo-1) * 2)) < (((nSlowMo-1) * 2) - 1)) return 0; // 50% and less
+	}
+
+	if (!bDrvOkay) {
+		return 1;
+	}
+
+	if (bPause) {
+		GetInput(false);						// Update burner inputs, but not game inputs
+		if (bPause != bPrevPause) {
+			VidPaint(2);                        // Redraw the screen (to ensure mode indicators are updated)
+		}
+	} else {
+
+		if (bDnNet) {							// dn: GGPO input sync, before the frame counters move (nCurrentFrame is part of the netplay state)
+			RunPacePresent();					// dn: wait for the steady schedule here, before reading the input, so the wait adds no input delay
+			GetInput(true);
+			if (DnNetGetInput()) {				// no frame this time (waiting for the peer): the sound card still takes this
+				if (pBurnSoundOut) {				// frame's sound, and the buffer holds the last one - replayed, that crackles.
+					INT16 l = pBurnSoundOut[nBurnSoundLen * 2 - 2], r = pBurnSoundOut[nBurnSoundLen * 2 - 1];
+					for (INT32 i = 0; i < nBurnSoundLen; i++) { pBurnSoundOut[i * 2] = l; pBurnSoundOut[i * 2 + 1] = r; }	// hold the last sample instead
+				}
+				return 0;
+			}
+		}
+
+		nFramesEmulated++;
+		nCurrentFrame++;
+
+		if (bDnNet) {
+			// dn: inputs already applied by DnNetGetInput()
+		} else if (kNetGame) {
+			GetInput(true);						// Update inputs
+			if (KailleraGetInput()) {			// Synchronize input with Kaillera
+				return 0;
+			}
+		} else {
+			if (nReplayStatus == 2) {
+				GetInput(false);				// Update burner inputs, but not game inputs
+				if (ReplayInput()) {			// Read input from file
+					SetPauseMode(1);            // Replay has finished
+					bAppDoFast = 0;
+					bAppDoFasttoggled = 0;      // Disable FFWD
+					MenuEnableItems();
+					InputSetCooperativeLevel(false, false);
+					return 0;
+				}
+			} else {
+				GetInput(true);					// Update inputs
+			}
+		}
+
+		CallRegisteredLuaFunctions(LUACALL_BEFOREEMULATION);
+		if (FBA_LuaUsingJoypad()) {
+			FBA_LuaReadJoypad();
+		}
+
+		if (nReplayStatus == 1) {
+			RecordInput();						// Write input to file
+		}
+
+		if (bDraw) {                            // Draw Frame
+			if ((bDraw & FFWD_GHOST_FRAME) == 0)
+				nFramesRendered++;
+
+			if (!bRunAhead || (BurnDrvGetFlags() & BDF_RUNAHEAD_DISABLED) || bAppDoFast) {
+#ifdef FBNEO_DEBUG
+				if (bShonkyProfileMode) do_shonky_profile();
+#endif
+				if (VidFrame()) {				// Do one normal frame (w/o RunAhead)
+
+					// VidFrame() failed, but we must run a driver frame because we have
+					// a clocked input.  Possibly from recording or netplay(!)
+					// Note: VidFrame() calls BurnDrvFrame() on success.
+					pBurnDraw = NULL;			// Make sure no image is drawn
+					BurnDrvFrame();
+
+					AudBlankSound();
+				}
+			} else {
+				pBurnDraw = (BurnDrvGetFlags() & BDF_RUNAHEAD_DRAWSYNC) ? pVidImage : NULL;
+				BurnDrvFrame();
+				StateRunAheadSave();
+				INT16 *pBurnSoundOut_temp = pBurnSoundOut;
+				pBurnSoundOut = NULL;
+				nCurrentFrame++;
+				bBurnRunAheadFrame = 1;
+
+				if (VidFrame()) {
+					// VidFrame() failed, but we must run a driver frame because we have
+					// an input.  Possibly from recording or netplay(!)
+					pBurnDraw = NULL;			// Make sure no image is drawn, since video failed this time 'round.
+					BurnDrvFrame();
+				}
+
+				bBurnRunAheadFrame = 0;
+				nCurrentFrame--;
+				StateRunAheadLoad();
+				pBurnSoundOut = pBurnSoundOut_temp; // restore pointer, for wav & avi writer
+			}
+		} else {								// frame skipping / ffwd-frame (without avi writing)
+			pBurnDraw = NULL;					// Make sure no image is drawn
+			BurnDrvFrame();
+		}
+
+		if (bDnNet) {
+			DnNetAdvanceFrame();				// dn: tell GGPO the frame is done
+			if (bDraw) VidPaint(0);				// dn: show it now, not at the start of the next frame (up to a frame sooner)
+			DnFrameLog(bDraw ? 'd' : 's');
+		}
+
+		if (kNetGame == 0) {                    // Rewind Implementation
+			StateRewindDoFrame(macroSystemRewind || bAppDoRewind, macroSystemRewindCancel, bRunPause);
+		}
+
+		if (bShowFPS) {
+			if (nDoFPS < nFramesRendered) {
+				DisplayFPS();
+				nDoFPS = nFramesRendered + ((bAppDoFast) ? 15 : 30);
+			}
+		}
+
+		FBA_LuaFrameBoundary();
+		CallRegisteredLuaFunctions(LUACALL_AFTEREMULATION);
+
+#ifdef INCLUDE_AVI_RECORDING
+		if (nAviStatus) {
+			if (AviRecordFrame(bDraw)) {
+				AviStop();
+			}
+		}
+#endif
+	}
+
+	bPrevPause = bPause;
+	if (bDraw & FFWD_GHOST_FRAME) bDraw = 0; // ffwd-frame w/avi write, do not draw!
+	bPrevDraw = bDraw;
+
+	return 0;
+}
+
+// Callback used when DSound needs more sound
+static int RunGetNextSound(int bDraw)
+{
+	if (nAudNextSound == NULL) {
+		return 1;
+	}
+
+	if (bRunPause) {
+		if (bAppDoStep) {
+			bAppDoStep = 0;									// done one step
+			RunFrame(bDraw, 0);
+		} else {
+			RunFrame(bDraw, 1);
+		}
+		memset(nAudNextSound, 0, nAudSegLen << 2);	// Write silence into the buffer
+
+		return 0;
+	}
+
+	int bBrokeOutOfFFWD = 0;
+	if (bAppDoFast) {									// do more frames
+		for (int i = 0; i < nFastSpeed; i++) {
+			if (!bAppDoFast || bRunPause) {
+				bBrokeOutOfFFWD = 1; // recording ended, etc.
+				break;
+			}                     // break out if no longer in ffwd
+#ifdef INCLUDE_AVI_RECORDING
+			if (nAviStatus) {
+				// Render frame with sound
+				pBurnSoundOut = nAudNextSound;
+				RunFrame(bDraw | FFWD_GHOST_FRAME, 0);
+			} else {
+				RunFrame(0, 0);
+			}
+#else
+			RunFrame(0, 0);
+#endif
+		}
+	}
+
+	if (!bBrokeOutOfFFWD) {
+		// Render frame with sound
+		pBurnSoundOut = nAudNextSound;
+		RunFrame(bDraw, 0);
+	}
+
+	if (WaveLog != NULL && pBurnSoundOut != NULL) {		// log to the file
+		fwrite(pBurnSoundOut, 1, nBurnSoundLen << 2, WaveLog);
+		pBurnSoundOut = NULL;
+	}
+
+	if (bAppDoStep || (bBrokeOutOfFFWD && bRunPause)) {
+		memset(nAudNextSound, 0, nAudSegLen << 2);		// Write silence into the buffer
+		AudBlankSound();
+	}
+	bAppDoStep = 0;										// done one step
+
+	return 0;
+}
+
+int RunIdle()
+{
+	int nTime, nCount;
+
+	if (bDnNet) {
+		DnNetIdle();							// dn: poll the network, run GGPO rollbacks, emit stats
+	}
+
+	if (bAudPlaying) {
+		// Run with sound
+		AudSoundCheck();
+		return 0;
+	}
+
+	// Run without sound
+	nTime = timeGetTime() - nNormalLast;
+	nCount = (nTime * nAppVirtualFps - nNormalFrac) / 100000;
+	if (nCount <= 0) {						// No need to do anything for a bit
+		//Sleep(2);
+		return 0;
+	}
+
+	nNormalFrac += nCount * 100000;
+	nNormalLast += nNormalFrac / nAppVirtualFps;
+	nNormalFrac %= nAppVirtualFps;
+
+	//if (bAppDoFast){						// Temporarily increase virtual fps
+	//	nCount *= nFastSpeed;
+	//}
+	if (nCount > 100) {						// Limit frame skipping
+		nCount = 100;
+	}
+	if (bRunPause) {
+		if (bAppDoStep) {					// Step one frame
+			nCount = 10;
+		} else {
+			RunFrame(1, 1);					// Paused
+			return 0;
+		}
+	}
+	bAppDoStep = 0;
+
+	if (bAppDoFast) {									// do more frames
+		for (int i = 0; i < nFastSpeed; i++) {
+#ifdef INCLUDE_AVI_RECORDING
+			if (nAviStatus) {
+				RunFrame(1, 0);
+			} else {
+				RunFrame(0, 0);
+			}
+#else
+			RunFrame(0, 0);
+#endif
+		}
+	}
+
+	if(!bAlwaysDrawFrames) {
+		for (int i = nCount / 10; i > 0; i--) {	// Mid-frames
+			RunFrame(0, 0);
+		}
+	}
+	RunFrame(1, 0);							// End-frame
+
+	return 0;
+}
+
+int RunReset()
+{
+	// Reset the speed throttling code
+	nNormalLast = 0; nNormalFrac = 0;
+	nPaceNext = 0;
+
+	// Reset FPS display
+	DisplayFPSInit();
+
+	if (!bAudPlaying) {
+		// run without sound
+		nNormalLast = timeGetTime();
+	}
+	return 0;
+}
+
+static int RunInit()
+{
+	// Try to run with sound
+	AudSetCallback(RunGetNextSound);
+	AudSoundPlay();
+
+	RunReset();
+
+	return 0;
+}
+
+static int RunExit()
+{
+	nNormalLast = 0;
+	// Stop sound if it was playing
+	AudSoundStop();
+
+	bAppDoFast = 0;
+	bAppDoFasttoggled = 0;
+	bAppDoRewind = 0;
+
+	return 0;
+}
+
+// Keyboard callback function, a way to provide a driver with shifted/unshifted ASCII data from the keyboard.  see drv/msx/d_msx.cpp for usage
+void (*cBurnerKeyCallback)(UINT8 code, UINT8 KeyType, UINT8 down) = NULL;
+
+static void BurnerHandlerKeyCallback(MSG *Msg, INT32 KeyDown, INT32 KeyType)
+{
+	INT32 shifted = (GetAsyncKeyState(VK_SHIFT) & 0x80000000) ? 0xf0 : 0;
+	INT32 scancode = (Msg->lParam >> 16) & 0xFF;
+	UINT8 keyboardState[256];
+	GetKeyboardState(keyboardState);
+	char charvalue[2];
+	if (ToAsciiEx(Msg->wParam, scancode, keyboardState, (LPWORD)&charvalue[0], 0, GetKeyboardLayout(0)) == 1) {
+		cBurnerKeyCallback(charvalue[0], shifted|KeyType, KeyDown);
+	}
+}
+
+// Kaillera signals
+// they usually come from a different thread, so we have to keep it simple
+// (and not involve the windows message pump)
+int k_bLoadNetgame = 0;          // (1) signal to start net-game, (2) update menus
+int k_player_id = 0;             // data from the Kaillera Client
+int k_numplayers = 0;            // ""
+char k_game_str[255] = { 0, };   // ""
+
+// Volume changes from the emulator hotkeys ('Silence' & 'Sound Restored' code added by CaptainCPS-X)
+static void RunToggleMute()
+{
+	TCHAR buffer[60];
+	bMute = !bMute;
+
+	if (bMute) {
+		nOldAudVolume = nAudVolume;
+		nAudVolume = 0;// mute sound
+		_stprintf(buffer, FBALoadStringEx(hAppInst, IDS_SOUND_MUTE, true), nAudVolume / 100);
+	} else {
+		nAudVolume = nOldAudVolume;// restore volume
+		_stprintf(buffer, FBALoadStringEx(hAppInst, IDS_SOUND_MUTE_OFF, true), nAudVolume / 100);
+	}
+	if (AudSoundSetVolume() == 0) {
+		VidSNewShortMsg(FBALoadStringEx(hAppInst, IDS_SOUND_NOVOLUME, true));
+	} else {
+		VidSNewShortMsg(buffer);
+	}
+}
+
+static void RunChangeVolume(int nDelta)
+{
+	if (bMute) return; // if mute, not do this
+
+	TCHAR buffer[60];
+	nOldAudVolume = nAudVolume;
+
+	nAudVolume += nDelta;
+	if (nAudVolume > 10000) nAudVolume = 10000;
+	if (nAudVolume < 0)     nAudVolume = 0;
+
+	if (AudSoundSetVolume() == 0) {
+		VidSNewShortMsg(FBALoadStringEx(hAppInst, IDS_SOUND_NOVOLUME, true));
+	} else {
+		_stprintf(buffer, FBALoadStringEx(hAppInst, IDS_SOUND_VOLUMESET, true), nAudVolume / 100);
+		VidSNewShortMsg(buffer);
+	}
+	MenuUpdateVolume();
+}
+
+// Emulator hotkeys that aren't menu commands (those go through the accelerator table, see hotkeys.cpp)
+static void RunHandleHotkey(INT32 nAction, MSG* pMsg)
+{
+	switch (nAction) {
+		case HOTKEY_ACT_EXIT_FULLSCREEN: {
+			if (nCmdOptUsed & 1) {
+				PostQuitMessage(0);
+			} else {
+				if (nVidFullscreen) {
+					nVidFullscreen = 0;
+					POST_INITIALISE_MESSAGE;
+				}
+			}
+			break;
+		}
+		case HOTKEY_ACT_TOGGLE_MENU: {
+			bMenuEnabled = !bMenuEnabled;
+			POST_INITIALISE_MESSAGE;
+			break;
+		}
+		case HOTKEY_ACT_REWIND: {
+			bAppDoRewind = 1;
+			break;
+		}
+		case HOTKEY_ACT_FFWD:
+		case HOTKEY_ACT_FFWD_TOGGLE: {
+			bool bOldAppDoFast = bAppDoFast;
+
+			if (kNetGame) {
+				break;
+			}
+
+			if (nAction == HOTKEY_ACT_FFWD) {
+				if (bRunPause) {
+					bAppDoStep = 1;
+				} else {
+					bAppDoFast = 1;
+				}
+			} else {
+				bAppDoFast = !bAppDoFast;
+				bAppDoFasttoggled = bAppDoFast;
+			}
+
+			if (bOldAppDoFast != bAppDoFast) {
+				DisplayFPSInit(); // resync fps display
+			}
+			break;
+		}
+		case HOTKEY_ACT_TOGGLE_FRAMECOUNTER: {
+			bReplayFrameCounterDisplay = !bReplayFrameCounterDisplay;
+			if (!bReplayFrameCounterDisplay) {
+				VidSKillTinyMsg();
+			}
+			break;
+		}
+		case HOTKEY_ACT_TOGGLE_FPS: {
+			bShowFPS = !bShowFPS;
+			if (bShowFPS) {
+				DisplayFPSInit();
+			} else {
+				VidSKillShortMsg();
+			}
+			break;
+		}
+		case HOTKEY_ACT_NETPLAY_CHAT: {
+			if (kNetGame && hwndChat == NULL) {
+				if (AppMessage(pMsg)) {
+					ActivateChat();
+				}
+			}
+			break;
+		}
+		case HOTKEY_ACT_MUTE:				RunToggleMute();			break;
+		case HOTKEY_ACT_VOLUME_UP:			RunChangeVolume(+1000);		break;
+		case HOTKEY_ACT_VOLUME_DOWN:		RunChangeVolume(-1000);		break;
+		case HOTKEY_ACT_VOLUME_UP_FINE:		RunChangeVolume(+100);		break;
+		case HOTKEY_ACT_VOLUME_DOWN_FINE:	RunChangeVolume(-100);		break;
+
+		case HOTKEY_ACT_LUA_OPEN:			ScrnInitLua();																break;	// Open (L)ua Dialog
+		case HOTKEY_ACT_LUA_CLOSE:			PostMessage(LuaConsoleHWnd, WM_CLOSE, 0, 0);								break;
+		case HOTKEY_ACT_LUA_RUN:			PostMessage(LuaConsoleHWnd, WM_COMMAND, IDC_BUTTON_LUARUN, 0);				break;
+		case HOTKEY_ACT_LUA_STOP:			PostMessage(LuaConsoleHWnd, WM_COMMAND, IDC_BUTTON_LUASTOP, 0);				break;	// (P)ause Lua Scripting (This is the stop button)
+		case HOTKEY_ACT_LUA_BROWSE:			PostMessage(LuaConsoleHWnd, WM_COMMAND, IDC_BUTTON_LUABROWSE, 0);			break;	// (B)rowse Lua Scripts
+	}
+}
+
+// The main message loop
+int RunMessageLoop()
+{
+	int bRestartVideo;
+	MSG Msg;
+
+	do {
+		bRestartVideo = 0;
+
+		// Remove pending initialisation messages from the queue
+		while (PeekMessage(&Msg, NULL, WM_APP + 0, WM_APP + 0, PM_NOREMOVE)) {
+			if (Msg.message != WM_QUIT)	{
+				PeekMessage(&Msg, NULL, WM_APP + 0, WM_APP + 0, PM_REMOVE);
+			}
+		}
+
+		RunInit();
+
+		ShowWindow(hScrnWnd, nAppShowCmd);												// Show the screen window
+		nAppShowCmd = SW_NORMAL;
+
+		SetForegroundWindow(hScrnWnd);
+
+		GameInpCheckLeftAlt();
+		GameInpCheckMouse();															// Hide the cursor
+
+		if (bVidDWMSync) {
+			bprintf(0, _T("[Win7+] Sync to DWM is enabled (if available).\n"));
+			SuperWaitVBlankInit();
+		}
+
+		if (bAutoLoadGameList && !nCmdOptUsed) {
+			static INT32 bLoaded = 0; // only do this once (at startup!)
+
+			if (bLoaded == 0)
+				PostMessage(hScrnWnd, WM_COMMAND, MAKEWPARAM(MENU_LOAD, 1), 0);
+			bLoaded = 1;
+		}
+
+		while (1) {
+			if (k_bLoadNetgame) {
+				if (k_bLoadNetgame == 2) {
+					k_bLoadNetgame = 0;
+					MenuEnableItems();
+					continue;
+				}
+				k_bLoadNetgame = 0;
+
+				if (bDrvOkay) {
+					StopReplay();
+#ifdef INCLUDE_AVI_RECORDING
+					AviStop();
+#endif
+					AudSoundStop();										// Stop while we load roms
+					DrvExit();
+				}
+
+				// find the game
+				bool bFound = false;
+
+				for (nBurnDrvActive = 0; nBurnDrvActive < nBurnDrvCount; nBurnDrvActive++) {
+					char* szDecoratedName = DecorateKailleraGameName(nBurnDrvActive);
+
+					if (!strcmp(szDecoratedName, k_game_str)) {
+						bFound = true;
+						break;
+					}
+				}
+
+				if (!bFound) {
+					bprintf(PRINT_ERROR, _T("Kaillera: Can't find game in list!\n"));
+					Kaillera_End_Game();
+					continue; // carry on!
+				}
+
+				kNetGame = 1;
+
+				bCheatsAllowed = (nKailleraCheatEnableHack == 0) ? false : true; // Disable cheats during netplay unless hack enabled....
+				bprintf(0, _T("cheats allowerd %x\n"), bCheatsAllowed);
+				AudSoundStop();										// Stop while we load roms
+				DrvInit(nBurnDrvActive, false);						// Init the game driver
+
+				AudSoundPlay();										// Restart sound
+				SetFocus(hScrnWnd);
+				POST_INITIALISE_MESSAGE;                            // Re-create main window with selected game's dimensions
+
+				TCHAR szTemp1[256];
+				TCHAR szTemp2[256];
+				VidSAddChatMsg(FBALoadStringEx(hAppInst, IDS_NETPLAY_START, true), 0xFFFFFF, BurnDrvGetText(DRV_FULLNAME), 0xFFBFBF);
+				_sntprintf(szTemp1, 256, FBALoadStringEx(hAppInst, IDS_NETPLAY_START_YOU, true), k_player_id);
+				_sntprintf(szTemp2, 256, FBALoadStringEx(hAppInst, IDS_NETPLAY_START_TOTAL, true), k_numplayers);
+				VidSAddChatMsg(szTemp1, 0xFFFFFF, szTemp2, 0xFFBFBF);
+			}
+
+			if (PeekMessage(&Msg, NULL, 0, 0, PM_REMOVE)) {
+				// A message is waiting to be processed
+				if (Msg.message == WM_QUIT)	{											// Quit program
+					break;
+				}
+				if (Msg.message == (WM_APP + 0)) {										// Restart video
+					bRestartVideo = 1;
+					break;
+				}
+
+				if (bMenuEnabled && nVidFullscreen == 0) {								// Handle keyboard messages for the menu
+					if (MenuHandleKeyboard(&Msg)) {
+						continue;
+					}
+				}
+
+				if (Msg.message == WM_SYSKEYDOWN || Msg.message == WM_KEYDOWN) {
+					const UINT nVK = (UINT)Msg.wParam;
+					const bool bAltDown = (Msg.lParam & 0x20000000) != 0;		// An Alt/AltGr-key is held
+
+					if (bAltDown && nVK == VK_MENU) {
+						continue;
+					}
+
+					if (!bAltDown && cBurnerKeyCallback) {
+						BurnerHandlerKeyCallback(&Msg, (Msg.message == WM_KEYDOWN) ? 1 : 0, 0);
+					}
+
+#if defined (FBNEO_DEBUG)
+					if (bAltDown && nVK == 'C') {
+						static int count = 0;
+						if (count == 0) {
+							count++;
+							{ char* p = NULL; if (*p) { printf("crash...\n"); } }
+						}
+					}
+					if (!bAltDown && (nVK == 'N' || nVK == 'M')) {
+						counter += (nVK == 'M') ? 1 : -1;
+						if (counter < 0) {
+							bprintf(PRINT_IMPORTANT, _T("*** New counter value: %04X (%d).\n"), counter, counter);
+						} else {
+							bprintf(PRINT_IMPORTANT, _T("*** New counter value: %04X.\n"), counter);
+						}
+					}
+#endif
+
+					if (hwndChat) {
+						// Netplay chat is active: Esc / Enter close / send it, other emulator hotkeys are suspended while typing
+						if (!bAltDown && nVK == VK_ESCAPE) {
+							DeActivateChat();
+						}
+						if (!bAltDown && nVK == VK_RETURN) {
+							int i = 0;
+							while (EditText[i]) {
+								if (EditText[i++] != 0x20) {
+									break;
+								}
+							}
+							if (i) {
+								Kaillera_Chat_Send(TCHARToANSI(EditText, NULL, 0));
+							}
+							DeActivateChat();
+						}
+					} else {
+						RunHandleHotkey(HotkeyFindAction(nVK, HotkeyGetModifiers(&Msg)), &Msg);
+					}
+				} else {
+					if (Msg.message == WM_SYSKEYUP || Msg.message == WM_KEYUP) {
+						const UINT nVK = (UINT)Msg.wParam;
+
+						if (cBurnerKeyCallback)
+							BurnerHandlerKeyCallback(&Msg, 0, 0);
+
+						if (nVK == VK_MENU) {
+							continue;
+						}
+
+						// "Hold" hotkeys stop when their key is released, whatever modifiers are held at that point
+						if (HotkeyActionUsesKey(HOTKEY_ACT_REWIND, nVK)) {
+							bAppDoRewind = 0;
+						}
+
+						if (HotkeyActionUsesKey(HOTKEY_ACT_FFWD, nVK) || HotkeyActionUsesKey(HOTKEY_ACT_FFWD_TOGGLE, nVK)) {
+							bool bOldAppDoFast = bAppDoFast;
+
+							if (!bAppDoFasttoggled)
+								bAppDoFast = 0;
+							bAppDoFasttoggled = 0;
+							if (bOldAppDoFast != bAppDoFast) {
+								DisplayFPSInit(); // resync fps display
+							}
+						}
+					}
+				}
+
+				// Check for messages for dialogs etc.
+				if (AppMessage(&Msg)) {
+					if (TranslateAccelerator(hScrnWnd, hAccel, &Msg) == 0) {
+						if (hwndChat) {
+							TranslateMessage(&Msg);
+						}
+						DispatchMessage(&Msg);
+					}
+				}
+			} else {
+				// No messages are waiting
+				SplashDestroy(0);
+				RunIdle();
+			}
+		}
+
+		RunExit();
+		MediaExit();
+		if (bRestartVideo) {
+			MediaInit();
+		}
+	} while (bRestartVideo);
+
+	return 0;
+}

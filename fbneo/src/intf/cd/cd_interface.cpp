@@ -1,0 +1,173 @@
+// CD/CD-ROM support
+#include "burner.h"
+#include "cd_img.h"
+
+bool bCDEmuOkay = false;
+UINT32 nCDEmuSelect = 0;
+
+CDEmuStatusValue CDEmuStatus;
+
+static InterfaceInfo CDEmuInfo = { NULL, NULL, NULL };
+
+static struct CDEmuDo* pCDEmuDo[] =
+{
+#if defined BUILD_WIN32
+	&cdimgDo,
+#elif defined BUILD_SDL2 || defined BUILD_SDL
+	&cdimgDo,
+#elif defined (_XBOX)
+	&cdimgDo,
+#endif
+};
+
+#define CDEMU_LEN (sizeof(pCDEmuDo) / sizeof(pCDEmuDo[0]))
+
+TCHAR CDEmuImage[MAX_PATH] = _T("");
+UINT8 CDEmuImageTOCSHA1[MAX_PATH] = { 0, };
+
+
+// ----------------------------------------------------------------------------
+
+INT32 CDEmuExit()
+{
+	IntInfoFree(&CDEmuInfo);
+
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+	bCDEmuOkay = false;
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuExit();
+}
+
+INT32 CDEmuInit()
+{
+	INT32 nRet;
+
+	// Always use cdimgDo (index 0) backend - it handles all formats:
+	// .cue/.bin, .ccd/.img/.sub, and .chd files
+	nCDEmuSelect = 0;
+
+	if (nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	CDEmuStatus = idle;
+
+	if ((nRet = pCDEmuDo[nCDEmuSelect]->CDEmuInit()) == 0) {
+		bCDEmuOkay = true;
+	}
+
+	return nRet;
+}
+
+INT32 CDEmuStop()
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuStop();
+}
+
+INT32 CDEmuPlay(UINT8 M, UINT8 S, UINT8 F)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuPlay(M, S, F);
+}
+
+INT32 CDEmuLoadSector(INT32 LBA, char* pBuffer)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 0;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuLoadSector(LBA, pBuffer);
+}
+
+INT32 CDEmuReadDataSector(INT32 nLba, UINT8* pBuffer)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN || !pCDEmuDo[nCDEmuSelect]->CDEmuReadDataSector) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuReadDataSector(nLba, pBuffer);
+}
+
+UINT8* CDEmuReadTOC(INT32 track)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return NULL;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuReadTOC(track);
+}
+
+UINT8* CDEmuReadQChannel()
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return NULL;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuReadQChannel();
+}
+
+INT32 CDEmuGetSoundBuffer(INT16* buffer, INT32 samples)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuGetSoundBuffer(buffer, samples);
+}
+
+INT32 CDEmuSetVolume(double dVolume)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuSetVolume(dVolume);
+}
+
+INT32 CDEmuGetCurrentLBA()
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 0;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuGetCurrentLBA();
+}
+
+INT32 CDEmuScan(INT32 nAction, INT32 *pnMin)
+{
+	if (!bCDEmuOkay || nCDEmuSelect >= CDEMU_LEN) {
+		return 1;
+	}
+
+	return pCDEmuDo[nCDEmuSelect]->CDEmuScan(nAction, pnMin);
+}
+
+InterfaceInfo* CDEmuGetInfo()
+{
+	if (IntInfoInit(&CDEmuInfo)) {
+		IntInfoFree(&CDEmuInfo);
+		return NULL;
+	}
+
+	if (bCDEmuOkay) {
+
+		CDEmuInfo.pszModuleName = pCDEmuDo[nCDEmuSelect]->szModuleName;
+
+	 	if (pCDEmuDo[nCDEmuSelect]->GetPluginSettings) {
+			pCDEmuDo[nCDEmuSelect]->GetPluginSettings(&CDEmuInfo);
+		}
+	} else {
+		IntInfoAddStringInterface(&CDEmuInfo, _T("CD/CD-ROM emulation module not initialised"));
+	}
+
+	return &CDEmuInfo;
+}
