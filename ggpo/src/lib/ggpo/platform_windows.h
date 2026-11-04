@@ -20,7 +20,7 @@ public:  // types
 
 public:  // functions
    static ProcessID GetProcessID() { return GetCurrentProcessId(); }
-   static void AssertFailed(char *msg) { MessageBoxA(NULL, msg, "GGPO Assertion Failed", MB_OK | MB_ICONEXCLAMATION); }
+   static void AssertFailed(char *msg) { OutputDebugStringA(msg); }   // dn: was a message box, which nobody can see behind the lobby's window
    static uint32 GetCurrentTimeMS() { return timeGetTime(); }
    static int GetConfigInt(const char* name);
    static bool GetConfigBool(const char* name);

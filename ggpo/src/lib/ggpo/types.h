@@ -61,7 +61,7 @@ typedef int int32;
          Log("\n");                                         \
          Log("\n");                                         \
          Platform::AssertFailed(assert_buf);                \
-         exit(0);                                           \
+         exit(1);   /* dn: was 0, which reads as a clean end */ \
       }                                                     \
    } while (false)
 

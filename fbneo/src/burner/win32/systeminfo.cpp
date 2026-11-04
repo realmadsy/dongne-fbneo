@@ -1,5 +1,6 @@
 #include "burner.h"
 #include "build_details.h"
+#include "dn.h"
 #include <tlhelp32.h>
 #include <setupapi.h>
 #include <psapi.h>
@@ -1310,6 +1311,17 @@ static INT_PTR CALLBACK SysInfoProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM l
 LONG CALLBACK ExceptionFilter(_EXCEPTION_POINTERS* pExceptionInfo)
 {
 	int nRet;
+
+	if (bDnNet) {	// dn: the report dialog would wait behind the lobby's window, and hold it disabled, with nobody to press OK
+		static LONG once = 0;
+		if (InterlockedExchange(&once, 1) == 0) {
+			char code[16];
+			sprintf(code, "%08X", (unsigned)pExceptionInfo->ExceptionRecord->ExceptionCode);
+			DnEmitError("crash", code);
+			DnEmitDrain(500);
+		}
+		TerminateProcess(GetCurrentProcess(), DN_EXIT_OTHER);
+	}
 
 	// If we're getting recursive calls to this function, bail out
 	if (nRecursion++) {

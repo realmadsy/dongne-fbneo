@@ -315,6 +315,6 @@ InputQueue::Log(const char *fmt, ...)
    va_start(args, fmt);
    vsnprintf(buf + offset, ARRAY_SIZE(buf) - offset - 1, fmt, args);
    buf[ARRAY_SIZE(buf)-1] = '\0';
-   ::Log(buf);
+   ::Log("%s", buf);   // dn: buf may hold a percent sign (the stats line does): as a format it ended the process
    va_end(args);
 }

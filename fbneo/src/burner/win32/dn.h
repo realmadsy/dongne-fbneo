@@ -11,6 +11,7 @@ struct DnArgs {
 	std::wstring rompath, soundDump, frameLog;	// soundDump: raw 16-bit stereo, one block per emulated frame (tests). frameLog: see DnFrameLog
 	int players = 2, me = 1, localPort = 7000, delay = 2, frames = 0;	// delay -1 = auto (--delay auto)
 	int testStart = 0;		// --test-start <frame>: acts as if the start key went down at that frame, and reports the credits (tests)
+	int testCrash = 0;		// --test-crash 1: crashes on the first input read (tests)
 	bool fastStart = false;	// --fast-start 1: skip the boot, open on character select (DnFastStart)
 	bool freeCoin = false;	// --free-coin 1: the coin key works and start is only start (tools/latency.ps1 times the coin key)
 	unsigned int seed = 1;

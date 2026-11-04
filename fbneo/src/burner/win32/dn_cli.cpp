@@ -68,6 +68,7 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		else if (k == L"--sound-dump") a.soundDump = v;
 		else if (k == L"--frame-log") a.frameLog = v;
 		else if (k == L"--test-start") ok = ParseInt(v, 1, 100000000, a.testStart);
+		else if (k == L"--test-crash") ok = ParseInt(v, 1, 1, a.testCrash);
 		else if (k == L"--free-coin") a.freeCoin = wcscmp(v, L"1") == 0;
 		else if (k == L"--fast-start") a.fastStart = wcscmp(v, L"1") == 0;
 		else if (k == L"--frames") ok = ParseInt(v, 0, 100000000, a.frames);

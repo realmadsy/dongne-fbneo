@@ -509,6 +509,14 @@ int DnP2PLoad()
 	nCmdOptUsed = 2;		// like "-w": windowed, and no game-select dialog at startup
 	nVidFullscreen = 0;
 
+	// Sound: WASAPI with 4 frames of buffer (~67 ms) instead of DirectSound's 6 (~100 ms); hits are heard sooner.
+	// MediaInit() falls back to DirectSound if WASAPI can't start. Before the game loads: its sound chips are set up for
+	// this rate, and running them at another one writes past their buffers. One fixed rate, whatever the settings file
+	// or the fallback, because the rate is part of what rollback saves: every peer needs the same one.
+	nAudSelect = 2;
+	nAudSegCount = 4;
+	nAudSampleRate[0] = nAudSampleRate[2] = 48000;
+
 	if ((gExitCode = DnLoadGame(gArgs)) != 0) return 1;
 
 	gAlone = gPlayers == 1;		// alone in a room: no peer and no rollback, so no GGPO (it can't run a session of one)
@@ -575,10 +583,6 @@ int DnP2PLoad()
 	kNetGame = 1;			// FBNeo's netplay switches: no pause, ffwd, rewind or pacing tricks
 	nVidSDisplayStatus = 0;	// no FBNeo "kaillera" icon: it sat on top of the game's 2P score, and the lobby shows the connection
 
-	// Sound: WASAPI with 4 frames of buffer (~67 ms) instead of DirectSound's 6 (~100 ms); hits are heard sooner.
-	// MediaInit() falls back to DirectSound if WASAPI can't start.
-	nAudSelect = 2;
-	nAudSegCount = 4;
 	bAlwaysDrawFrames = 1;	// two frames due at one sound wakeup: show both, on schedule (RunPacePresent), instead of dropping the first
 	gLastStats = GetTickCount();
 
@@ -677,6 +681,7 @@ static void DnFastStart()
 int DnNetGetInput()
 {
 	if ((!gSession && !gAlone) || gEnding) return 1;
+	if (gArgs.testCrash) *(volatile int*)0 = 0;
 	static bool fastStarted = false;
 	if (gArgs.fastStart && !fastStarted) { fastStarted = true; DnFastStart(); }	// before GGPO saves its first frame
 	if (gFramesAhead > 0) {	// GGPO says we're ahead of the peer: hold this frame
