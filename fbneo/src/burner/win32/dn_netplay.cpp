@@ -114,7 +114,7 @@ static bool DnSwitch(int code, bool focus)
 	return (focus || (code >= 0x4000 && code < 0x8000)) && InputReadSwitch(code);
 }
 
-// Start = coin + start: players never need a coin key or a joystick button for it (plan §4.6). One press runs this:
+// Start = coin + start: players never need a coin key or a joystick button for it (plan Â§4.6). One press runs this:
 // coin held long enough for the game to count it, a wait (SF2 ignores start until its title screen is up, over 1 s), then start.
 // ponytail: a press in the middle of a fight also puts in a coin. Knowing when a game wants one takes per-game RAM addresses.
 enum { DN_ROLE_START = 4, DN_COIN_FRAMES = 6, DN_START_AT = 90, DN_START_END = 96 };
@@ -364,6 +364,31 @@ static int DnSyncTest(const DnArgs& a)
 	return DN_EXIT_OK;
 }
 
+// SF2 Dash stage edit, in memory only: everyone keeps the standard game files, and nothing of the game goes in our source.
+// Graphics are not part of the game's state or logic, so this can't affect a match.
+// Zangief's stage: the fence, the lever and the chain ends stand in front of the fighters and hide their feet. They are
+// 8x8 tiles on the top layer, used nowhere else in a match, and the floor is whole behind them.
+extern UINT8* CpsGfx;
+extern UINT32 nCpsGfxLen;
+static int gStageTiles = 0;
+
+static void DnStageEdits()
+{
+	if (gArgs.game != "sf2ce") return;
+	static const struct { UINT32 from, to; } kFront[] = {
+		{ 0x4284, 0x428a }, { 0x4294, 0x429a }, { 0x429e, 0x429f }, { 0x42a4, 0x42aa }, { 0x42ae, 0x42af }, { 0x42b4, 0x42b9 }, { 0x42be, 0x42bf },
+		{ 0x42c5, 0x42c8 }, { 0x42ce, 0x42cf }, { 0x42d5, 0x42d8 }, { 0x42de, 0x42e0 }, { 0x42ed, 0x42f1 }, { 0x42fd, 0x430f }, { 0x4313, 0x4336 },
+		{ 0x4338, 0x4346 }, { 0x4348, 0x4355 }, { 0x4358, 0x4365 }, { 0x4368, 0x4375 }, { 0x4378, 0x437f }, { 0x4446, 0x444a }, { 0x444c, 0x444f },
+		{ 0x4456, 0x445a }, { 0x445c, 0x445f }, { 0x446c, 0x446f }, { 0x447c, 0x447f },
+	};
+	for (size_t i = 0; i < sizeof(kFront) / sizeof(kFront[0]); i++) {
+		for (UINT32 t = kFront[i].from; t <= kFront[i].to; t++) {
+			UINT32 at = (t + 0x10000) << 6;
+			if (at + 64 <= nCpsGfxLen) { memset(CpsGfx + at, 0, 64); gStageTiles++; }
+		}
+	}
+}
+
 // Rom path + driver init + netplay-safe input setup. Returns 0 or a DN_EXIT_* code (error already emitted).
 static int DnLoadGame(const DnArgs& a)
 {
@@ -381,6 +406,7 @@ static int DnLoadGame(const DnArgs& a)
 		return DN_EXIT_ROM;
 	}
 
+	DnStageEdits();
 	InpDIPSWResetDIPs();	// driver default DIPs on every peer, whatever the local config says
 	DnApplyConstants();
 	gPlayers = a.players;
@@ -589,6 +615,7 @@ int DnP2PLoad()
 	INT32 w = 0, h = 0;
 	BurnDrvGetVisibleSize(&w, &h);
 	char j[64];
+	if (gStageTiles) { char e[64]; sprintf(e, "{\"ev\":\"stage-edits\",\"tiles\":%d}", gStageTiles); DnEmit(e); }
 	sprintf(j, "{\"ev\":\"ready\",\"w\":%d,\"h\":%d}", w, h);
 	DnEmit(j);
 	return 0;
