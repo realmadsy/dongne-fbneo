@@ -451,6 +451,9 @@ INT32 VidFrameCallback(bool bRedraw)        // Called from blitter  (VidFrame() 
 #if defined (BUILD_WIN32) || defined (INCLUDE_LUA_SUPPORT)
 		FBA_LuaGui((unsigned char*)pVidImage, nVidImageWidth, nVidImageHeight, nVidImageBPP, nVidImagePitch);
 #endif
+#if defined (BUILD_WIN32)
+		{ extern void DnPracticeOverlay(UINT8*, int, int, int, int); DnPracticeOverlay(pVidImage, nVidImageWidth, nVidImageHeight, nVidImageBPP, nVidImagePitch); }	// dn: practice readouts
+#endif
 	}
 
 	return 0;

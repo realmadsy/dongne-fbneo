@@ -114,7 +114,7 @@ static bool DnSwitch(int code, bool focus)
 	return (focus || (code >= 0x4000 && code < 0x8000)) && InputReadSwitch(code);
 }
 
-// Start = coin + start: players never need a coin key or a joystick button for it (plan Â§4.6). One press runs this:
+// Start = coin + start: players never need a coin key or a joystick button for it (plan ÃÂ§4.6). One press runs this:
 // coin held long enough for the game to count it, a wait (SF2 ignores start until its title screen is up, over 1 s), then start.
 // ponytail: a press in the middle of a fight also puts in a coin. Knowing when a game wants one takes per-game RAM addresses.
 enum { DN_ROLE_START = 4, DN_COIN_FRAMES = 6, DN_START_AT = 90, DN_START_END = 96 };
@@ -136,7 +136,7 @@ uint32_t DnPackLocalInput(bool focus)
 	}
 	if (gArgs.testStart && gFrame >= gArgs.testStart && gFrame < gArgs.testStart + 3) keys |= 1u << DN_ROLE_START;
 
-	const bool startMakesCoin = gKeymapSet && !gArgs.freeCoin;
+	const bool startMakesCoin = gKeymapSet && !gArgs.freeCoin && !gArgs.practice;	// practice: the game's own start, no coins
 	bool coin = false;
 	if (startMakesCoin) {
 		const bool down = (keys >> DN_ROLE_START) & 1;
@@ -414,6 +414,8 @@ static int DnLoadGame(const DnArgs& a)
 	return 0;
 }
 
+static int DnPracticeTest(const DnArgs& a);
+
 int DnRun(const DnArgs& a)
 {
 	bNoPopups = true;
@@ -425,7 +427,7 @@ int DnRun(const DnArgs& a)
 
 	int rc = DnLoadGame(a);
 	if (rc == 0) {
-		rc = DnSyncTest(a);
+		rc = a.mode == "practice" ? DnPracticeTest(a) : DnSyncTest(a);
 		DrvExit();
 	}
 	BurnLibExit();
@@ -449,6 +451,7 @@ static bool gAutoHuman = false;	// --auto-input human:<seed>
 // inserts a coin only when it reaches 0: every start or continue uses one, so that is one coin per match.
 static const struct { const char* game; UINT32 credits; } kCredits[] = {
 	{ "sf2ce", 0xFF82D9 },
+	{ "kof98", 0xD00034 },
 };
 static UINT32 gCreditAddr = 0;
 
@@ -545,7 +548,8 @@ int DnP2PLoad()
 
 	if ((gExitCode = DnLoadGame(gArgs)) != 0) return 1;
 
-	gAlone = gPlayers == 1;		// alone in a room: no peer and no rollback, so no GGPO (it can't run a session of one)
+	gAlone = gPlayers == 1 || gArgs.practice;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
+	if (gArgs.practice) DnSetPractice(gArgs.practiceSet);
 	if (!gAlone) {
 		if (!DnPortFree(gArgs.localPort)) {
 			DnEmitError("port_in_use", ("udp port " + std::to_string(gArgs.localPort)).c_str());
@@ -661,20 +665,50 @@ void DnFrameLog(char kind)
 // scripted coins and starts, and the session opens on character select. Same emulator + same ROM (the room server
 // checks both) + same script = the same state: the sum is reported so a test can compare the peers.
 // ponytail: the frames are per game, found by trying; a game not listed boots normally.
-static const struct { const char* game; int coin1, coin2, start1, start2, end; } kFastStart[] = {
-	{ "sf2ce", 900, 915, 1000, 1060, 1120 },
+// skip: both press button 1 to leave a scene shown after the starts (KOF '98's how to play), or 0.
+static const struct { const char* game; int coin1, coin2, start1, start2, skip, end; } kFastStart[] = {
+	{ "sf2ce", 900, 915, 1000, 1060, 0, 1120 },
+	{ "kof98", 720, 740, 820, 880, 960, 1000 },
 };
+
+// KOF '98's own PRACTICE, only in its home version: the standard file on the home BIOS (AES World: English). This opens on team select.
+extern UINT8 NeoSystem, NeoReset;
+enum { DN_BIOS_MASK = 0x3F, DN_BIOS_AES_WORLD = 0x10 };
+static void DnKofPractice()
+{
+	NeoSystem = (NeoSystem & ~DN_BIOS_MASK) | DN_BIOS_AES_WORLD;
+	NeoReset = 1;
+	uint32_t startBit = 0, downBit = 0, fireBit = 0;
+	struct BurnInputInfo bii;
+	for (size_t k = 0; k < gPlayerInp[0].size(); k++) {
+		BurnDrvGetInputInfo(&bii, gPlayerInp[0][k]);
+		if (!bii.szInfo) continue;
+		if (!_stricmp(bii.szInfo, "p1 start")) startBit = 1u << k;
+		if (!_stricmp(bii.szInfo, "p1 down")) downBit = 1u << k;
+		if (!_stricmp(bii.szInfo, "p1 fire 1")) fireBit = 1u << k;
+	}
+	for (int f = 0; f < 2160; f++) {
+		uint32_t in = 0;
+		if (f >= 1100 && f < 1106) in |= startBit;
+		for (int d = 0; d < 5; d++) if (f >= 1300 + d * 40 && f < 1306 + d * 40) in |= downBit;		// the menu's sixth line
+		if ((f >= 1600 && f < 1606) || (f >= 2000 && f < 2006)) in |= fireBit;
+		DnApplyInputs(&in);
+		DnStepFrame(false);
+	}
+	DnEmit("{\"ev\":\"faststart\",\"practice\":true}");
+}
 
 static void DnFastStart()
 {
-	int coin1 = 0, coin2 = 0, start1 = 0, start2 = 0, end = 0;
+	if (gArgs.practice && gArgs.game == "kof98") { DnKofPractice(); return; }
+	int coin1 = 0, coin2 = 0, start1 = 0, start2 = 0, skip = 0, end = 0;
 	for (size_t i = 0; i < sizeof(kFastStart) / sizeof(kFastStart[0]); i++) {
 		if (gArgs.game == kFastStart[i].game) {
-			coin1 = kFastStart[i].coin1; coin2 = kFastStart[i].coin2; start1 = kFastStart[i].start1; start2 = kFastStart[i].start2; end = kFastStart[i].end;
+			coin1 = kFastStart[i].coin1; coin2 = kFastStart[i].coin2; start1 = kFastStart[i].start1; start2 = kFastStart[i].start2; skip = kFastStart[i].skip; end = kFastStart[i].end;
 		}
 	}
 	if (!end) return;
-	uint32_t coinBits[2] = { 0, 0 }, startBits[2] = { 0, 0 };
+	uint32_t coinBits[2] = { 0, 0 }, startBits[2] = { 0, 0 }, fireBits[2] = { 0, 0 };
 	struct BurnInputInfo bii;
 	for (int p = 0; p < 2 && p < gPlayers; p++) {
 		for (size_t k = 0; k < gPlayerInp[p].size(); k++) {
@@ -682,6 +716,7 @@ static void DnFastStart()
 			size_t n = bii.szInfo ? strlen(bii.szInfo) : 0;
 			if (n >= 5 && !_stricmp(bii.szInfo + n - 5, " coin")) coinBits[p] |= 1u << k;
 			if (n >= 6 && !_stricmp(bii.szInfo + n - 6, " start")) startBits[p] |= 1u << k;
+			if (n >= 7 && !_stricmp(bii.szInfo + n - 7, " fire 1")) fireBits[p] |= 1u << k;
 		}
 	}
 	LARGE_INTEGER t0, t1, hz;
@@ -692,6 +727,7 @@ static void DnFastStart()
 		if (gPlayers > 1 && f >= coin2 && f < coin2 + 6) in[0] |= coinBits[0];	// alone: one coin, one start
 		if (f >= start1 && f < start1 + 6) in[0] |= startBits[0];
 		if (f >= start2 && f < start2 + 6) in[1] |= startBits[1];
+		if (skip && f >= skip && f < skip + 6) { in[0] |= fireBits[0]; in[1] |= fireBits[1]; }
 		DnApplyInputs(in);
 		DnStepFrame(false);
 	}
@@ -703,6 +739,387 @@ static void DnFastStart()
 	char j[128];
 	sprintf(j, "{\"ev\":\"faststart\",\"frames\":%d,\"ms\":%d,\"sum\":%u,\"credits\":%d}", end, (int)((t1.QuadPart - t0.QuadPart) * 1000 / hz.QuadPart), (unsigned)sum, gCreditAddr ? (int)ReadValueAtHardwareAddress(gCreditAddr, 1, 0) : -1);
 	DnEmit(j);
+}
+
+// ---------------------------------------------------------------- practice
+// SF2 Dash alone: the other fighter follows the panel's settings by pressing buttons, as a player would. Everyone keeps the
+// standard game file. Only practice writes to the game's memory, and it never runs in a match (no peer, no rollback).
+// Addresses found by recording every frame of a scripted fight and comparing.
+enum { PR_P1 = 0xFF83BE, PR_P2 = 0xFF86BE, PR_TIMER = 0xFF8ABE, PR_RAM = 0xFF0000 };
+enum { PR_STATE = 0x03, PR_X = 0x06, PR_HP = 0x2A, PR_HP_LATER = 0x2C, PR_HP_BAR = 0x1BD, PR_STUN_TIME = 0x5D, PR_STUN = 0x5F, PR_BALL = 0x1D4, PR_FIGHTER = 0x291, PR_PICKED = 0x2B5 };
+enum { ST_STAND = 0x00, ST_CROUCH = 0x02, ST_JUMP = 0x04, ST_BLOCK = 0x08, ST_ATTACK = 0x0A, ST_SPECIAL = 0x0C, ST_HURT = 0x0E, ST_THROWN = 0x14 };
+enum { MOVE_STAND, MOVE_FORWARD, MOVE_BACK, MOVE_JUMP_FORWARD, MOVE_JUMP_BACK, MOVE_JUMP, MOVE_CROUCH };
+enum { GUARD_OFF, GUARD_ON, GUARD_STEP, GUARD_REVERSAL };
+enum { PR_FULL = 0x90, PR_FLOOR = 0x48, PR_SETTLE = 20, PR_CALM = 10, PR_QUIET = 30, PR_ATTACK_RANGE = 190, PR_JUMP_RANGE = 130, PR_BALL_RANGE = 110 };
+enum { R_UP = 1 << 0, R_DOWN = 1 << 1, R_LEFT = 1 << 2, R_RIGHT = 1 << 3, R_LP = 1 << 5, R_MP = 1 << 6, R_HP = 1 << 7, R_LK = 1 << 8, R_MK = 1 << 9 };
+// The back-charge moves first asked for lose their charge: back has to be let go or the first hit is blocked. These are their stand-ins.
+enum { REV_PRESS, REV_UPPERCUT, REV_CHARGE_DOWN, REV_MASH };
+static const struct { int kind; int buttons; } kReversal[12] = {
+	{ REV_UPPERCUT, R_LP },				// Ryu
+	{ REV_MASH, R_LP },					// E. Honda: light hundred hand slap
+	{ REV_MASH, R_LP },					// Blanka: light electric thunder
+	{ REV_CHARGE_DOWN, R_LK },			// Guile: light flash kick
+	{ REV_UPPERCUT, R_LP },				// Ken
+	{ REV_MASH, R_LK },					// Chun-Li: light lightning legs
+	{ REV_PRESS, R_LP | R_MP | R_HP },	// Zangief: double lariat
+	{ REV_PRESS, R_HP },				// Dhalsim: standing strong punch
+	{ REV_PRESS, R_MK },				// M. Bison: standing medium kick
+	{ REV_UPPERCUT, R_LP },				// Sagat: light tiger uppercut
+	{ REV_PRESS, R_HP },				// Balrog: standing strong punch
+	{ REV_PRESS, R_MP },				// Vega: standing medium punch
+};
+enum { WRITE_TIME = 1, WRITE_HEALTH = 2, WRITE_STUN = 4 };
+static int gPrMove = MOVE_STAND, gPrGuard = GUARD_OFF, gPrStun = 1, gPrWrites = WRITE_TIME | WRITE_HEALTH | WRITE_STUN;	// writes: tests turn parts off
+static uint32_t gPrBit[DN_ROLES];
+static int gPrShowHp = 0, gPrShowStun = 0, gPrBoxes = 0, gPrBoxSide = 1;
+static int gPrTestHp = 0;	// tests: what the dummy's health is refilled to, instead of full	// readouts and boxes drawn on the picture
+// 1 STEP: 0 = waiting for the first hit, 1 = it landed; back to 0 once the fighter has been free for PR_QUIET frames.
+static int gPrStep = 0, gPrQuiet = 0, gPrFired = 0;
+static int gPrHits = 0, gPrDamage = 0, gPrLastHp = PR_FULL, gPrLastHp1 = PR_FULL, gPrSettle[2] = { 0, 0 }, gPrCalm[2] = { 0, 0 };
+static bool gPrReported = false;
+
+void DnSetPractice(const std::string& line)
+{
+	std::vector<int> v;
+	if ((v = DnJsonInts(line, "move")).size() == 1 && v[0] >= MOVE_STAND && v[0] <= MOVE_CROUCH) gPrMove = v[0];
+	if ((v = DnJsonInts(line, "guard")).size() == 1 && v[0] >= GUARD_OFF && v[0] <= GUARD_REVERSAL) { gPrGuard = v[0]; gPrStep = gPrFired = 0; }
+	if ((v = DnJsonInts(line, "stun")).size() == 1) gPrStun = v[0] != 0;
+	if ((v = DnJsonInts(line, "writes")).size() == 1) gPrWrites = v[0];
+	if ((v = DnJsonInts(line, "hpnum")).size() == 1) gPrShowHp = v[0] != 0;
+	if ((v = DnJsonInts(line, "testhp")).size() == 1) gPrTestHp = v[0];
+	if ((v = DnJsonInts(line, "stunnum")).size() == 1) gPrShowStun = v[0] != 0;
+	if ((v = DnJsonInts(line, "boxes")).size() == 1) gPrBoxes = v[0];
+	if ((v = DnJsonInts(line, "boxside")).size() == 1 && (v[0] == 1 || v[0] == 2)) gPrBoxSide = v[0];
+}
+
+static int PrByte(UINT32 a) { return (int)ReadValueAtHardwareAddress(a, 1, 0); }
+static int PrWord(UINT32 a) { return (int)ReadValueAtHardwareAddress(a, 2, 0); }
+
+// Readouts drawn on the finished picture (VidFrameCallback): what the screen shows, never the game. A 5x7 font, one bit a pixel.
+static const char kPrGlyphs[] = "0123456789HPSTUN/";
+static const UINT8 kPrFont[17][7] = {
+	{ 14, 17, 19, 21, 25, 17, 14 }, { 4, 12, 4, 4, 4, 4, 14 }, { 14, 17, 1, 2, 4, 8, 31 }, { 31, 2, 4, 2, 1, 17, 14 },
+	{ 2, 6, 10, 18, 31, 2, 2 }, { 31, 16, 30, 1, 1, 17, 14 }, { 6, 8, 16, 30, 17, 17, 14 }, { 31, 1, 2, 4, 8, 8, 8 },
+	{ 14, 17, 17, 14, 17, 17, 14 }, { 14, 17, 17, 15, 1, 2, 12 }, { 17, 17, 17, 31, 17, 17, 17 }, { 30, 17, 17, 30, 16, 16, 16 },
+	{ 15, 16, 16, 14, 1, 1, 30 }, { 31, 4, 4, 4, 4, 4, 4 }, { 17, 17, 17, 17, 17, 17, 14 }, { 17, 25, 21, 19, 17, 17, 17 },
+	{ 1, 1, 2, 4, 8, 16, 16 },
+};
+static void PrPixel(UINT8* img, int w, int h, int bpp, int pitch, int x, int y, UINT32 c)
+{
+	if (x < 0 || y < 0 || x >= w || y >= h) return;
+	UINT8* p = img + y * pitch + x * bpp;
+	if (bpp == 2) *(UINT16*)p = (UINT16)c;
+	else if (bpp == 3) { p[0] = c & 0xFF; p[1] = (c >> 8) & 0xFF; p[2] = (c >> 16) & 0xFF; }
+	else *(UINT32*)p = c;
+}
+static void PrText(UINT8* img, int w, int h, int bpp, int pitch, int x, int y, const char* s, UINT32 ink, UINT32 shade)
+{
+	for (int pass = 0; pass < 2; pass++) {
+		int cx = x;
+		for (const char* q = s; *q; q++, cx += 6) {
+			const char* g = strchr(kPrGlyphs, *q);
+			if (!g || !*q) continue;
+			const UINT8* rows = kPrFont[g - kPrGlyphs];
+			for (int r = 0; r < 7; r++) for (int b = 0; b < 5; b++) if ((rows[r] >> (4 - b)) & 1) {
+				if (pass == 0) { PrPixel(img, w, h, bpp, pitch, cx + b + 1, y + r, shade); PrPixel(img, w, h, bpp, pitch, cx + b, y + r + 1, shade); PrPixel(img, w, h, bpp, pitch, cx + b + 1, y + r + 1, shade); }
+				else PrPixel(img, w, h, bpp, pitch, cx + b, y + r, ink);
+			}
+		}
+	}
+}
+static int PrLong(UINT32 a) { return (int)ReadValueAtHardwareAddress(a, 4, 0); }
+static void PrRect(UINT8* img, int w, int h, int bpp, int pitch, int x0, int y0, int x1, int y1, UINT32 c)
+{
+	for (int x = x0; x <= x1; x++) { PrPixel(img, w, h, bpp, pitch, x, y0, c); PrPixel(img, w, h, bpp, pitch, x, y1, c); }
+	for (int y = y0; y <= y1; y++) { PrPixel(img, w, h, bpp, pitch, x0, y, c); PrPixel(img, w, h, bpp, pitch, x1, y, c); }
+}
+enum { PR_BAR_LEFT = 32, PR_BAR_RIGHT = 352, PR_HP_TEXT_Y = 12, PR_STUN_Y = 47, PR_STUN_BAR = 48, PR_DIZZY = 31, PR_STUN_BAR_TIME = 180 };
+enum { PR_CAMERA_X = 0xFF8BC4, PR_CAMERA_Y = 0xFF8BC8, PR_Y = 0x0A, PR_FLIP = 0x12, PR_ANIM = 0x1A, PR_BOXTAB = 0x34 };
+// Boxes from the game's own tables: the frame of animation (PR_ANIM) names a box in each table at +8.., the fighter's table list
+// (PR_BOXTAB) gives where each table starts. Tables 0-2 are what can be hit (head, body, legs), 4 is the attack (12 bytes an entry),
+// 5 is the body that pushes. Table 3 is left out: two entries, and nothing seen using it. Each box: centre x, y from the fighter's
+// point (x mirrored by the facing), half width, half height. A fireball is an object of the same shape.
+enum { BOX_ATTACK = 1, BOX_HURT = 2, BOX_BALL_ATTACK = 4, BOX_BALL_HURT = 8, BOX_PUSH = 16, BOX_PIVOT = 32, PR_GROUND = 233 };
+static void DnPracticeBoxesOf(UINT8* img, int w, int h, int bpp, int pitch, UINT32 base, bool ball)
+{
+	const int camx = PrWord(PR_CAMERA_X), camy = PrWord(PR_CAMERA_Y);
+	const int px = PrWord(base + PR_X) - camx, py = PrWord(base + PR_Y) - camy;
+	const int flip = PrByte(base + PR_FLIP);
+	const UINT32 anim = (UINT32)PrLong(base + PR_ANIM), tab = (UINT32)PrLong(base + PR_BOXTAB);
+	for (int k = 0; k < 6; k++) {
+		const int show = k == 4 ? (ball ? BOX_BALL_ATTACK : BOX_ATTACK) : k == 5 ? (ball ? 0 : BOX_PUSH) : k == 3 ? 0 : (ball ? BOX_BALL_HURT : BOX_HURT);
+		const int id = show & gPrBoxes ? PrByte(anim + 8 + k) : 0;
+		if (!id) continue;
+		const UINT32 e = tab + (UINT32)PrWord(tab + k * 2) + id * (k == 4 ? 12 : 4);
+		const int bx = (INT8)PrByte(e), by = (INT8)PrByte(e + 1), rw = PrByte(e + 2), rh = PrByte(e + 3);
+		const int cx = px + (flip ? -bx : bx), cy = PR_GROUND - (py + by);
+		const UINT32 c = show == BOX_ATTACK ? BurnHighCol(255, 70, 70, 0) : show == BOX_HURT ? BurnHighCol(90, 150, 255, 0) : show == BOX_BALL_ATTACK ? BurnHighCol(255, 110, 230, 0) : show == BOX_BALL_HURT ? BurnHighCol(80, 230, 255, 0) : BurnHighCol(90, 230, 110, 0);
+		PrRect(img, w, h, bpp, pitch, cx - rw, cy - rh, cx + rw, cy + rh, c);
+	}
+	if (!ball && (gPrBoxes & BOX_PIVOT)) {
+		const int gy = PR_GROUND - py;
+		for (int d = -3; d <= 3; d++) { PrPixel(img, w, h, bpp, pitch, px + d, gy, BurnHighCol(255, 255, 255, 0)); PrPixel(img, w, h, bpp, pitch, px, gy + d, BurnHighCol(255, 255, 255, 0)); }
+	}
+}
+void DnPracticeOverlay(UINT8* img, int w, int h, int bpp, int pitch)
+{
+	if (!gArgs.practice || gArgs.game != "sf2ce" || !img || !PrWord(PR_P2 + PR_HP)) return;
+	if (gPrBoxes) {		// the chosen side's fighter and its fireball
+		const UINT32 base = gPrBoxSide == 2 ? PR_P2 : PR_P1, ball = (UINT32)PrWord(base + PR_BALL);
+		DnPracticeBoxesOf(img, w, h, bpp, pitch, base, false);
+		if (ball) DnPracticeBoxesOf(img, w, h, bpp, pitch, PR_RAM + ball, true);
+	}
+	if (!gPrShowHp && !gPrShowStun) return;
+	const UINT32 ink = BurnHighCol(0xFF, 0xFF, 0xFF, 0), shade = BurnHighCol(0, 0, 0, 0), well = BurnHighCol(0x22, 0x22, 0x22, 0);
+	const UINT32 red = BurnHighCol(0xE8, 0x38, 0x2F, 0), amber = BurnHighCol(0xF0, 0xA0, 0x20, 0);
+	char t[24];
+	for (int p = 0; p < 2; p++) {
+		const UINT32 base = p ? PR_P2 : PR_P1;
+		if (gPrShowHp) {		// above the health bar, under the score line
+			sprintf(t, "HP %d", PrWord(base + PR_HP));
+			PrText(img, w, h, bpp, pitch, p ? PR_BAR_RIGHT - ((int)strlen(t) * 6 - 1) : PR_BAR_LEFT, PR_HP_TEXT_Y, t, ink, shade);
+		}
+		if (!gPrShowStun) continue;
+		// Under the name: the stun meter out of PR_DIZZY (31: every fighter held 30 and got dizzy at 31), then the frames until it
+		// empties (each hit adds 130; the bar is full at PR_STUN_BAR_TIME, the number keeps counting past it). 1P fills from the left, 2P from the right.
+		const int values[2] = { PrByte(base + PR_STUN), PrByte(base + PR_STUN_TIME) }, full[2] = { PR_DIZZY, PR_STUN_BAR_TIME };
+		for (int row = 0; row < 2; row++) {
+			const int y = PR_STUN_Y + row * 9, x = p ? w - 26 - PR_STUN_BAR : 26;
+			const int fill = (PR_STUN_BAR - 2) * (values[row] < full[row] ? values[row] : full[row]) / full[row];
+			for (int yy = y - 1; yy <= y + 5; yy++) for (int xx = x - 1; xx <= x + PR_STUN_BAR; xx++) {
+				const bool edge = yy == y - 1 || yy == y + 5 || xx == x - 1 || xx == x + PR_STUN_BAR;
+				const bool frame = yy == y || yy == y + 4 || xx == x || xx == x + PR_STUN_BAR - 1;
+				const int inner = xx - (x + 1);
+				const bool filled = !frame && !edge && (p ? inner >= PR_STUN_BAR - 2 - fill : inner < fill);
+				PrPixel(img, w, h, bpp, pitch, xx, yy, edge ? shade : frame ? ink : filled ? (row ? amber : red) : well);
+			}
+			if (row == 0) sprintf(t, "%03d/%03d", values[0], PR_DIZZY); else sprintf(t, "%03d", values[1]);
+			const int tw = (int)strlen(t) * 6 - 1;
+			PrText(img, w, h, bpp, pitch, p ? x - 4 - tw : x + PR_STUN_BAR + 4, y - 1, t, ink, shade);
+		}
+	}
+}
+
+static uint32_t DnPracticeDummy()
+{
+	const int s1 = PrByte(PR_P1 + PR_STATE), s2 = PrByte(PR_P2 + PR_STATE), x1 = PrWord(PR_P1 + PR_X), x2 = PrWord(PR_P2 + PR_X);
+	const int back = x2 > x1 ? R_RIGHT : R_LEFT, forward = x2 > x1 ? R_LEFT : R_RIGHT;
+	const bool free = s2 == ST_STAND || s2 == ST_CROUCH;
+	const bool hurt = s2 == ST_HURT || s2 == ST_THROWN;
+	const UINT32 ball = (UINT32)PrWord(PR_P1 + PR_BALL);
+	const bool threat = ((s1 == ST_ATTACK || s1 == ST_SPECIAL) && abs(x1 - x2) < PR_ATTACK_RANGE)
+		|| (s1 == ST_JUMP && abs(x1 - x2) < PR_JUMP_RANGE)
+		|| (ball && abs(PrWord(PR_RAM + ball + PR_X) - x2) < PR_BALL_RANGE);
+
+	if (hurt) { gPrStep = 1; gPrFired = 0; gPrReported = false; }	// a reversal after every hit
+	gPrQuiet = free ? gPrQuiet + 1 : 0;
+	if (gPrQuiet >= PR_QUIET) gPrStep = 0;
+
+	if (gPrGuard == GUARD_REVERSAL) {
+		const int rev = PrByte(PR_P2 + PR_FIGHTER) < 12 ? PrByte(PR_P2 + PR_FIGHTER) : 0;
+		const int kind = kReversal[rev].kind, buttons = kReversal[rev].buttons;
+				if (gPrStep == 0) {
+			if (kind == REV_CHARGE_DOWN) return R_DOWN;
+		} else if (!free && !gPrFired && s2 != ST_ATTACK && s2 != ST_SPECIAL) {
+			static int phase = 0;
+			phase++;
+						if (kind == REV_CHARGE_DOWN) return R_DOWN;
+			if (kind == REV_MASH) return phase & 1 ? buttons : 0;
+			return 0;
+		} else {
+			gPrFired++;
+			if (!gPrReported && (s2 == ST_ATTACK || s2 == ST_SPECIAL)) {
+				gPrReported = true;
+				char j[80];
+				sprintf(j, "{\"ev\":\"reversal\",\"fighter\":%d,\"after\":%d}", rev, gPrFired);
+				DnEmit(j);
+			}
+			if (kind == REV_MASH) return gPrFired < 30 && gPrFired & 1 ? buttons : 0;
+			if (kind == REV_UPPERCUT) return gPrFired == 1 ? forward : gPrFired == 2 ? R_DOWN : gPrFired == 3 ? R_DOWN | forward : gPrFired < 9 ? R_DOWN | forward | buttons : 0;	// the game reads this motion only once free to act
+			if (gPrFired > 6) return 0;
+			if (kind == REV_CHARGE_DOWN) return gPrFired == 1 ? R_UP : R_UP | buttons;
+			return buttons;
+		}
+	}
+
+	// Crouching guard blocks every ground attack and never walks off when the attack is still out of reach; a jump-in needs a standing one.
+	if ((gPrGuard == GUARD_ON || (gPrGuard == GUARD_STEP && gPrStep == 1)) && threat) return back | (s1 == ST_JUMP ? 0 : R_DOWN);
+	switch (gPrMove) {
+		case MOVE_FORWARD: return forward;
+		case MOVE_BACK: return back;
+		case MOVE_JUMP_FORWARD: return R_UP | forward;
+		case MOVE_JUMP_BACK: return R_UP | back;
+		case MOVE_JUMP: return R_UP;
+		case MOVE_CROUCH: return R_DOWN;
+	}
+	return 0;
+}
+
+// Time never runs out. Health falls during a combo, so its damage can be seen, and is full again as soon as the fighter is free.
+// PR_FLOOR keeps a long combo from ending the round: it is more than any one hit takes. The bar has its own number, which falls behind health.
+// A fireball takes health some frames before the fighter reacts, and changing health in those frames cancels the reaction. So health is
+// only refilled when nothing can still land: the fighter has been free for PR_CALM frames, the other one isn't attacking and has no
+// fireball out, and PR_SETTLE frames have gone by since health last fell. The floor, which has to act in the middle of a combo, waits
+// until the game has caught its own copy of health (PR_HP_LATER) up with the health a hit took: the game sizes the reaction from the
+// gap between the two, so a floor write before that made a fireball crossing the floor land as a hit of no damage, with almost no
+// push back.
+static void DnPracticeHealth(UINT32 base, int hp)
+{
+	if (!(gPrWrites & WRITE_HEALTH)) return;
+	WriteValueAtHardwareAddress(base + PR_HP, hp, 2, 0);
+	WriteValueAtHardwareAddress(base + PR_HP_LATER, hp, 2, 0);
+}
+
+static void DnPracticeBody()
+{
+	const int s1 = PrByte(PR_P1 + PR_STATE), s2 = PrByte(PR_P2 + PR_STATE), hp1 = PrWord(PR_P1 + PR_HP), hp2 = PrWord(PR_P2 + PR_HP);
+	if (hp2 == 0) return;		// no fight yet: the game sets health up when the round starts
+	if (gPrWrites & WRITE_TIME) WriteValueAtHardwareAddress(PR_TIMER, 0x99, 1, 0);
+	if (hp2 < gPrLastHp && s2 != ST_BLOCK) {
+		gPrHits++;
+		gPrDamage += gPrLastHp - hp2;
+		char j[64];
+		sprintf(j, "{\"ev\":\"combo\",\"hits\":%d,\"damage\":%d}", gPrHits, gPrDamage);
+		DnEmit(j);
+	}
+	gPrSettle[1] = hp2 < gPrLastHp ? PR_SETTLE : gPrSettle[1] > 0 ? gPrSettle[1] - 1 : 0;
+	gPrSettle[0] = hp1 < gPrLastHp1 ? PR_SETTLE : gPrSettle[0] > 0 ? gPrSettle[0] - 1 : 0;
+	gPrLastHp = hp2;
+	gPrLastHp1 = hp1;
+	const bool free2 = s2 == ST_STAND || s2 == ST_CROUCH || s2 == ST_JUMP, free1 = s1 == ST_STAND || s1 == ST_CROUCH || s1 == ST_JUMP;
+	const bool quiet1 = s1 != ST_ATTACK && s1 != ST_SPECIAL && !PrWord(PR_P1 + PR_BALL), quiet2 = s2 != ST_ATTACK && s2 != ST_SPECIAL && !PrWord(PR_P2 + PR_BALL);
+	gPrCalm[1] = free2 && quiet1 ? gPrCalm[1] + 1 : 0;
+	gPrCalm[0] = free1 && quiet2 ? gPrCalm[0] + 1 : 0;
+	if (free2) gPrHits = gPrDamage = 0;
+	if (gPrCalm[1] >= PR_CALM && !gPrSettle[1]) {
+		const int full2 = gPrTestHp ? gPrTestHp : PR_FULL;
+		if (hp2 != full2) {
+			DnPracticeHealth(PR_P2, full2);
+			if (gPrWrites & WRITE_HEALTH) WriteValueAtHardwareAddress(PR_P2 + PR_HP_BAR, full2, 1, 0);
+			gPrLastHp = full2;
+		}
+	} else if (hp2 < PR_FLOOR && !free2 && PrWord(PR_P2 + PR_HP_LATER) == hp2) {
+		DnPracticeHealth(PR_P2, PR_FLOOR);
+		gPrLastHp = PR_FLOOR;
+	}
+	if (gPrCalm[0] >= PR_CALM && !gPrSettle[0] && hp1 != PR_FULL) {
+		DnPracticeHealth(PR_P1, PR_FULL);
+		if (gPrWrites & WRITE_HEALTH) WriteValueAtHardwareAddress(PR_P1 + PR_HP_BAR, PR_FULL, 1, 0);
+		gPrLastHp1 = PR_FULL;
+	} else if (hp1 < PR_FLOOR && !free1 && PrWord(PR_P1 + PR_HP_LATER) == hp1) {
+		DnPracticeHealth(PR_P1, PR_FLOOR);
+		gPrLastHp1 = PR_FLOOR;
+	}
+	if (!gPrStun && (gPrWrites & WRITE_STUN)) {
+		for (UINT32 base = PR_P1; base <= PR_P2; base += PR_P2 - PR_P1) {
+			WriteValueAtHardwareAddress(base + PR_STUN_TIME, 0, 1, 0);
+			WriteValueAtHardwareAddress(base + PR_STUN, 0, 1, 0);
+		}
+	}
+}
+
+// The player's own presses for the panel's input list, by role (bit 0 up ... bit 10 fire 6), whenever they change. Start is left out.
+static void DnPracticeInput(uint32_t local, int frame)
+{
+	static int last = -1;
+	int roles = 0;
+	for (size_t k = 0; k < gBitRole.size(); k++) if (gBitRole[k] >= 0 && gBitRole[k] != DN_ROLE_START && ((local >> k) & 1)) roles |= 1 << gBitRole[k];
+	if (roles == last) return;
+	last = roles;
+	char j[64];
+	sprintf(j, "{\"ev\":\"input\",\"f\":%d,\"r\":%d}", frame, roles);
+	DnEmit(j);
+}
+
+static void DnPracticeFrame(uint32_t local, uint32_t* in)
+{
+	static bool mapped = false;
+	if (!mapped) {
+		mapped = true;
+		struct BurnInputInfo bii;
+		for (size_t k = 0; k < gPlayerInp[1].size(); k++) {
+			BurnDrvGetInputInfo(&bii, gPlayerInp[1][k]);
+			for (int r = 0; r < DN_ROLES && bii.szInfo && !_strnicmp(bii.szInfo, "p2 ", 3); r++) {
+				if (!_stricmp(bii.szInfo + 3, kRoleInfo[r])) gPrBit[r] = 1u << k;
+			}
+		}
+	}
+	in[0] = local;
+	in[1] = 0;
+	if (!PrByte(PR_P1 + PR_PICKED)) return;		// the player picks their own fighter, then the other's
+	if (!PrByte(PR_P2 + PR_PICKED)) {
+		static bool released = false;		// the button that picked the first fighter must not pick the second too
+		released = released || !(local & DN_GAME_BITS);
+		in[0] = local & ~(uint32_t)DN_GAME_BITS;
+		if (released) in[1] = local & DN_GAME_BITS;
+		return;
+	}
+	DnPracticeBody();
+	const uint32_t roles = DnPracticeDummy();
+	for (int r = 0; r < DN_ROLES; r++) if ((roles >> r) & 1) in[1] |= gPrBit[r];
+}
+
+// --script: frame,length,roles;... the player's presses, for tests.
+static uint32_t DnScriptInput(const std::string& script, int f)
+{
+	struct Press { int frame, len; uint32_t bits; };
+	static std::vector<Press> presses;
+	static bool parsed = false;
+	if (!parsed) {
+		parsed = true;
+		for (size_t at = 0; at < script.size();) {
+			size_t e = script.find(';', at);
+			if (e == std::string::npos) e = script.size();
+			int frame = 0, len = 0, roles = 0;
+			if (sscanf(script.substr(at, e - at).c_str(), "%d,%d,%d", &frame, &len, &roles) == 3) {
+				uint32_t bits = 0;
+				for (size_t k = 0; k < gBitRole.size(); k++) if (gBitRole[k] >= 0 && ((roles >> gBitRole[k]) & 1)) bits |= 1u << k;
+				presses.push_back({ frame, len, bits });
+			}
+			at = e + 1;
+		}
+	}
+	uint32_t v = 0;
+	for (size_t i = 0; i < presses.size(); i++) if (f >= presses[i].frame && f < presses[i].frame + presses[i].len) v |= presses[i].bits;
+	return v;
+}
+
+// dn:practice: a whole session with no window, as fast as it goes: tests script the player and read what happened.
+static int DnPracticeTest(const DnArgs& a)
+{
+	DnSetPractice(a.practiceSet);
+	DnFastStart();
+	int lastState = -1;
+	for (int f = 0; f < a.frames; f++) {
+		uint32_t local = DnScriptInput(a.script, f), in[GGPO_MAX_PLAYERS] = { 0 };
+		DnPracticeInput(local, f);
+		if (a.game == "sf2ce") DnPracticeFrame(local, in); else in[0] = local;
+		DnApplyInputs(in);
+		DnStepFrame(false);
+		if (a.game != "sf2ce") continue;
+		static FILE* dump = a.dump.empty() ? NULL : _wfopen(a.dump.c_str(), L"wb");
+		if (dump) {		// both fighters, every frame, for tests that compare runs
+			UINT8 b[0x600];
+			for (int i = 0; i < 0x300; i++) { b[i] = (UINT8)PrByte(PR_P1 + i); b[0x300 + i] = (UINT8)PrByte(PR_P2 + i); }
+			fwrite(b, 1, sizeof(b), dump);
+		}
+		static int lastPicked = -1;
+		const int picked = PrByte(PR_P1 + PR_PICKED) + 2 * PrByte(PR_P2 + PR_PICKED);
+		if (picked != lastPicked) { lastPicked = picked; char e[64]; sprintf(e, "{\"ev\":\"picked\",\"f\":%d,\"v\":%d}", f, picked); DnEmit(e); }
+		int s2 = PrByte(PR_P2 + PR_STATE);
+		if (s2 != lastState) {
+			lastState = s2;
+			char j[120];
+			sprintf(j, "{\"ev\":\"state\",\"f\":%d,\"s\":%d,\"p1\":%d,\"p2\":%d,\"x\":%d,\"hp\":%d,\"stun\":%d,\"time\":%d}", f, s2, PrByte(PR_P1 + PR_FIGHTER), PrByte(PR_P2 + PR_FIGHTER),
+				PrWord(PR_P2 + PR_X) - PrWord(PR_P1 + PR_X), PrWord(PR_P2 + PR_HP), PrByte(PR_P2 + PR_STUN), PrByte(PR_TIMER));
+			DnEmit(j);
+		}
+	}
+	char j[120];
+	if (a.game != "sf2ce") return 0;
+	sprintf(j, "{\"ev\":\"practice-end\",\"p1\":%d,\"p2\":%d,\"s\":%d,\"x\":%d,\"hp\":%d,\"bar\":%d,\"time\":%d}", PrByte(PR_P1 + PR_FIGHTER), PrByte(PR_P2 + PR_FIGHTER), PrByte(PR_P2 + PR_STATE), PrWord(PR_P2 + PR_X) - PrWord(PR_P1 + PR_X), PrWord(PR_P2 + PR_HP), PrByte(PR_P2 + PR_HP_BAR), PrByte(PR_TIMER));
+	DnEmit(j);
+	return 0;
 }
 
 int DnNetGetInput()
@@ -727,7 +1144,14 @@ int DnNetGetInput()
 			DnEmit(j);
 		}
 	}
-	uint32_t local = gAutoRng ? DnBotInput() : ((DnInputOn() ? DnPackLocalInput(DnHasInputFocus()) : 0) | gCtrlBits);	// the controller shows either way
+	uint32_t local = !gArgs.script.empty() ? DnScriptInput(gArgs.script, gFrame) | gCtrlBits : gAutoRng ? DnBotInput() : ((DnInputOn() ? DnPackLocalInput(DnHasInputFocus()) : 0) | gCtrlBits);	// the controller shows either way
+	if (gArgs.practice) DnPracticeInput(local, gFrame);
+	if (gArgs.practice && gArgs.game == "sf2ce") {
+		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
+		DnPracticeFrame(local, in);
+		DnApplyInputs(in);
+		return 0;
+	}
 	if (gAlone) {
 		DnApplyInputs(&local);
 		return 0;
@@ -843,6 +1267,44 @@ static int DnPads()
 	return DN_EXIT_OK;
 }
 
+// dn:roms - no game loaded: the files a game needs, from FBNeo's own list, for the lobby to check a folder against.
+// ponytail: a clone's files in its parent's zip aren't told apart; the two games we offer have no parent. Add it with the first that does.
+static int DnRoms(const DnArgs& a)
+{
+	DnIpcStart(NULL);
+	BurnLibInit();
+	int nGame = BurnDrvGetIndex((char*)a.game.c_str());
+	if (nGame < 0) {
+		DnEmitError("bad_args", ("unknown game: " + a.game).c_str());
+		DnEmitDrain(500);
+		BurnLibExit();
+		return DN_EXIT_OTHER;
+	}
+	nBurnDrvActive = nGame;
+	std::vector<std::string> zips;
+	char* zipName = NULL;
+	for (UINT32 i = 0; BurnDrvGetZipName(&zipName, i) == 0; i++) zips.push_back(std::string(zipName) + ".zip");
+	std::string j = "{\"ev\":\"roms\",\"zips\":[";
+	for (size_t i = 0; i < zips.size(); i++) j += (i ? ",\"" : "\"") + zips[i] + "\"";
+	j += "],\"required\":[";
+	bool first = true;
+	for (UINT32 i = 0; i < 0x100; i++) {	// from 0x80 on: the board's files, the BIOS zip
+		struct BurnRomInfo ri;
+		memset(&ri, 0, sizeof(ri));
+		char* romName = NULL;
+		if (BurnDrvGetRomInfo(&ri, i) || !ri.nLen || (ri.nType & (BRF_OPT | BRF_NODUMP)) || BurnDrvGetRomName(&romName, i, 0) || !romName) continue;
+		char crc[16];
+		sprintf(crc, "%08x", ri.nCrc);
+		j += std::string(first ? "" : ",") + "{\"zip\":\"" + (i < 0x80 ? zips.front() : zips.back()) + "\",\"name\":\"" + romName + "\",\"crc\":\"" + crc + "\"}";
+		first = false;
+	}
+	j += "]}";
+	DnEmit(j.c_str());
+	DnEmitDrain(500);
+	BurnLibExit();
+	return 0;
+}
+
 bool DnTryMain(const wchar_t* cmdline, int& exitCode)
 {
 	if (wcsncmp(cmdline, L"dn:", 3) != 0) return false;
@@ -858,11 +1320,16 @@ bool DnTryMain(const wchar_t* cmdline, int& exitCode)
 		exitCode = DN_EXIT_OTHER;
 		return true;
 	}
+	if (a.mode == "roms") {
+		exitCode = DnRoms(a);
+		return true;
+	}
 	if (a.mode == "p2p") {	// runs inside the normal app (main.cpp calls DnP2PLoad)
 		gArgs = a;
 		bDnNet = true;
 		return false;
 	}
+	gArgs = a;
 	exitCode = DnRun(a);
 	return true;
 }

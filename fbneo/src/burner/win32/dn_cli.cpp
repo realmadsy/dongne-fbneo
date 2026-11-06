@@ -55,7 +55,7 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 
 	bool ok = true;
 	a.mode = Narrow(argv[0] + 3);
-	if (a.mode != "synctest" && a.mode != "p2p") { err = "unknown mode: " + a.mode; ok = false; }
+	if (a.mode != "synctest" && a.mode != "p2p" && a.mode != "roms" && a.mode != "practice") { err = "unknown mode: " + a.mode; ok = false; }
 
 	for (int i = 1; ok && i < argc; i++) {
 		std::wstring k = argv[i];
@@ -71,6 +71,15 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		else if (k == L"--test-crash") ok = ParseInt(v, 1, 1, a.testCrash);
 		else if (k == L"--free-coin") a.freeCoin = wcscmp(v, L"1") == 0;
 		else if (k == L"--fast-start") a.fastStart = wcscmp(v, L"1") == 0;
+		else if (k == L"--practice") a.practice = wcscmp(v, L"1") == 0;
+		else if (k == L"--practice-set") a.practiceSet = Narrow(v);
+		else if (k == L"--script") a.script = Narrow(v);
+		else if (k == L"--script-file") {		// tests: a script longer than FBNeo's command line takes
+			FILE* f = _wfopen(v, L"rb");
+			ok = f != NULL;
+			if (f) { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof(buf), f)) > 0) a.script.append(buf, n); fclose(f); }
+		}
+		else if (k == L"--dump") a.dump = v;
 		else if (k == L"--frames") ok = ParseInt(v, 0, 100000000, a.frames);
 		else if (k == L"--seed") { ok = ParseUInt(v, 0, 0xFFFFFFFFull, u); a.seed = (unsigned int)u; }
 		else if (k == L"--players") ok = ParseInt(v, 1, 4, a.players);	// 1: alone in a room until someone joins
@@ -86,10 +95,11 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 	LocalFree(argv);
 
 	if (ok && a.game.empty()) { err = "--game is required"; ok = false; }
-	if (ok && a.rompath.empty()) { err = "--rompath is required"; ok = false; }
+	if (ok && a.rompath.empty() && a.mode != "roms") { err = "--rompath is required"; ok = false; }
 	if (ok && a.mode == "synctest" && a.frames <= 0) { err = "--frames must be > 0 for synctest"; ok = false; }
 	if (ok && a.me > a.players) { err = "--me exceeds --players"; ok = false; }
-	if (ok && a.mode == "p2p") {
+	if (ok && a.mode == "practice") a.practice = true;
+	if (ok && a.mode == "p2p" && !a.practice) {
 		if ((int)a.peers.size() != a.players - 1) { err = "p2p needs one --peer per remote player"; ok = false; }
 		for (size_t i = 0; ok && i < a.peers.size(); i++) {
 			if (a.peers[i].player == a.me || a.peers[i].player > a.players) { err = "bad --peer player number"; ok = false; }

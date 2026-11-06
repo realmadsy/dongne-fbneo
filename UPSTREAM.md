@@ -35,3 +35,5 @@ FBNeo 라이선스(`emu/fbneo/src/license.txt`)에 따라 수정분은 공개한
 22. `emu/fbneo/src/burner/win32/dn_netplay.cpp` `DnP2PLoad()`: 사운드 장치와 표본 주파수(48 kHz 고정)를 게임을 불러오기 전에 정한다. 전에는 불러온 뒤에 WASAPI로 바꿔서, 설정 파일이 없는 새 설치본에서는 44.1 kHz로 준비된 사운드 칩이 48 kHz로 돌며 버퍼 끝을 넘어 썼다(`YM2151UpdateOne`).
 23. `emu/fbneo/src/burner/win32/systeminfo.cpp` `ExceptionFilter()`, `emu/ggpo/src/lib/ggpo/platform_windows.h` `AssertFailed()`, `types.h` `ASSERT`: 넷플레이 모드에서는 충돌이나 어설션 때 대화상자를 띄우지 않고 프로세스를 끝낸다. 대화상자는 로비 창 뒤에 숨어 로비를 비활성화한 채 기다렸다. 에뮬은 `{"ev":"error","code":"crash"}`를 보내고, 어설션은 종료 코드 1로 끝난다.
 24. `emu/fbneo/src/burner/win32/dn_netplay.cpp` `DnStageEdits()`: `sf2ce`의 장기에프 스테이지에서 캐릭터 앞을 가리는 울타리, 레버, 앞쪽 쇠사슬을 지운다. 게임 파일은 표준 그대로 두고, 불러온 그래픽 메모리에서 위쪽 레이어의 8×8 조각 197개를 비운다. 그래픽은 게임 상태에 들어가지 않으므로 대전에 영향이 없다. 소스에는 조각 번호만 있다.
+25. `emu/fbneo/src/burner/win32/dn_netplay.cpp` `DnRoms()`, `dn_cli.cpp`: `dn:roms --game <id>` 모드. 게임을 불러오지 않고 필요한 zip과 필수 파일의 이름, CRC를 FBNeo 목록에서 꺼내 JSON으로 출력한다. 로비가 게임 파일을 검사하는 기준이다.
+26. `emu/fbneo/src/burner/win32/dn_netplay.cpp` `kFastStart`, `kCredits`: `kof98`을 추가하고 `skip` 칸을 더했다. KOF '98은 시작 후 조작 안내를 버튼 1로 건너뛰어 약 1000프레임 만에 캐릭터 선택으로 간다.

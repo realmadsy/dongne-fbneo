@@ -6,8 +6,9 @@
 // A blocking write would freeze the game whenever the lobby stops reading for a moment (on Windows
 // its main thread is busy while a window is dragged or the mouse is held), and the peer freezes with
 // us. So during a session a writer thread does the writing; the game thread only queues lines.
+// The writer looks at the queue by itself: waking it from the game thread cost that frame up to 18 ms (measured on hits in practice).
 static CRITICAL_SECTION gOutLock;
-static HANDLE gOutEvent = NULL;
+static bool gOutAsync = false;
 static std::vector<std::string> gOutQueue;
 static volatile LONG gOutBusy = 0;
 
@@ -19,10 +20,12 @@ static void DnWrite(const std::string& line)
 	WriteFile(h, line.data(), (DWORD)line.size(), &n, NULL);
 }
 
+enum { DN_OUT_POLL_MS = 5 };
+
 static DWORD WINAPI StdoutThread(LPVOID)
 {
 	for (;;) {
-		WaitForSingleObject(gOutEvent, INFINITE);
+		Sleep(DN_OUT_POLL_MS);
 		std::vector<std::string> lines;
 		EnterCriticalSection(&gOutLock);
 		lines.swap(gOutQueue);
@@ -36,26 +39,26 @@ static DWORD WINAPI StdoutThread(LPVOID)
 static void DnEmitAsyncStart()
 {
 	InitializeCriticalSection(&gOutLock);
-	gOutEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+	gOutAsync = true;
 	CloseHandle(CreateThread(NULL, 0, StdoutThread, NULL, 0, NULL));
 }
 
 void DnEmit(const char* json)
 {
 	std::string line = std::string(json) + "\n";
-	if (!gOutEvent) {				// outside a session (synctest, startup errors): write directly
+	if (!gOutAsync) {				// outside a session (synctest, startup errors): write directly
 		DnWrite(line);
 		return;
 	}
 	EnterCriticalSection(&gOutLock);
 	gOutQueue.push_back(line);
+	InterlockedExchange(&gOutBusy, 1);
 	LeaveCriticalSection(&gOutLock);
-	SetEvent(gOutEvent);
 }
 
 void DnEmitDrain(DWORD ms)
 {
-	if (!gOutEvent) return;
+	if (!gOutAsync) return;
 	for (DWORD waited = 0; waited < ms; waited += 10) {
 		EnterCriticalSection(&gOutLock);
 		bool empty = gOutQueue.empty();
@@ -252,6 +255,7 @@ bool DnIpcPoll()
 		}
 		if (l.find("\"cmd\":\"keymap\"") != std::string::npos) DnSetKeymap(l);
 		if (l.find("\"cmd\":\"hotkeys\"") != std::string::npos) DnSetHotkeys(l);
+		if (l.find("\"cmd\":\"practice\"") != std::string::npos) DnSetPractice(l);
 		if (l.find("\"cmd\":\"rect\"") != std::string::npos) {
 			int x, y, w, h;
 			if (JsonInt(l, "x", x) && JsonInt(l, "y", y) && JsonInt(l, "w", w) && JsonInt(l, "h", h) && w > 0 && h > 0) {

@@ -1,4 +1,4 @@
-// dn: 동네오락실 netplay mode (dn:synctest / dn:p2p). See docs/superpowers/plans in the k-arcade repo.
+// dn: ëë¤ì¤ë½ì¤ netplay mode (dn:synctest / dn:p2p). See docs/superpowers/plans in the k-arcade repo.
 #pragma once
 
 #include <string>
@@ -8,11 +8,14 @@ struct DnPeer { int player; std::string ip; int port; };
 
 struct DnArgs {
 	std::string mode, game, autoInput;
-	std::wstring rompath, soundDump, frameLog;	// soundDump: raw 16-bit stereo, one block per emulated frame (tests). frameLog: see DnFrameLog
+	std::wstring rompath, soundDump, frameLog, dump;	// dump (dn:practice): both SF2 fighters' memory, 0x600 bytes a frame (tests)	// soundDump: raw 16-bit stereo, one block per emulated frame (tests). frameLog: see DnFrameLog
 	int players = 2, me = 1, localPort = 7000, delay = 2, frames = 0;	// delay -1 = auto (--delay auto)
 	int testStart = 0;		// --test-start <frame>: acts as if the start key went down at that frame, and reports the credits (tests)
 	int testCrash = 0;		// --test-crash 1: crashes on the first input read (tests)
 	bool fastStart = false;	// --fast-start 1: skip the boot, open on character select (DnFastStart)
+	bool practice = false;	// --practice 1: alone, no session; SF2 Dash's other fighter follows the panel, KOF '98 opens its own practice mode
+	std::string practiceSet;	// --practice-set: the settings to start with, as in the "practice" command
+	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
 	bool freeCoin = false;	// --free-coin 1: the coin key works and start is only start (tools/latency.ps1 times the coin key)
 	unsigned int seed = 1;
 	HWND parent = NULL;
@@ -44,6 +47,7 @@ INT32 InputReadSwitch(const INT32 nCode);
 bool DnTryMain(const wchar_t* cmdline, int& exitCode);	// true: fully handled (synctest, bad args); false: continue normal init
 int DnRun(const DnArgs& a);
 void DnSetKeymap(const std::string& line);	// {"cmd":"keymap","up":[200,16386],...,"fire1":[44]}: codes per role (keyboard DIK / FBNeo joystick)
+void DnSetPractice(const std::string& line);	// {"cmd":"practice","move":0,"guard":0,"stun":1}
 void DnSetHotkeys(const std::string& line);	// {"cmd":"hotkeys","hk":[code,mask,turbo,...]}: mask bit 0 = fire 1, turbo = period in frames or 0
 
 // dn:p2p runs inside FBNeo's normal app + message loop (main.cpp / run.cpp hooks)
