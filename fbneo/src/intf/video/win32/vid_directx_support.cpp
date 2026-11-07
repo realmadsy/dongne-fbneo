@@ -837,6 +837,18 @@ int VidSScaleImage(RECT* pRect, int nGameWidth, int nGameHeight, bool bVertScanl
 	pRect->top -= nHeight / 2;
 	pRect->bottom = pRect->top + nHeight;
 
+	{	// dn: inside the lobby, say the size of the picture whenever it changes (the lobby checks its shape)
+		extern HWND DnParentWnd();
+		extern void DnEmit(const char* json);
+		static int nDnLastW = -1, nDnLastH = -1;
+		if (DnParentWnd() && (nWidth != nDnLastW || nHeight != nDnLastH)) {
+			nDnLastW = nWidth; nDnLastH = nHeight;
+			char j[96];
+			sprintf(j, "{\"ev\":\"picture\",\"w\":%d,\"h\":%d,\"gw\":%d,\"gh\":%d}", nWidth, nHeight, nGameWidth, nGameHeight);
+			DnEmit(j);
+		}
+	}
+
 	return 0;
 }
 

@@ -41,6 +41,8 @@ static int gAsk[GGPO_MAX_PLAYERS] = { -1, -1, -1, -1 }, gAskShown[GGPO_MAX_PLAYE
 static bool gSwapAsked = false;			// a fighting game: an agreed swap, reported once, for the lobby to restart with
 static UINT8 gSwapNext[GGPO_MAX_PLAYERS];
 static bool gBadge[GGPO_MAX_PLAYERS][2];
+static bool gAssistOn[GGPO_MAX_PLAYERS][2];			// a hotkey (0) / turbo (1) held right now, as last reported
+static ULONGLONG gAssistSeen[GGPO_MAX_PLAYERS][2];	// when it was last seen held (GetTickCount64)
 static int gCtrl[GGPO_MAX_PLAYERS] = { -1, -1, -1, -1 };
 static uint32_t gCtrlBits = 1u << DN_BIT_KEYBOARD;	// FBNeo's own mapping (keyboard) until the lobby sends one
 static bool gSyncError = false;
@@ -140,8 +142,17 @@ static void DnApplyInputs(const uint32_t* in)
 			DnEmit(j);
 		}
 		for (int b = 0; b < 2; b++) {
-			if (gBadge[p][b] || !((in[p] >> (DN_BIT_HOTKEY + b)) & 1)) continue;
-			gBadge[p][b] = true;	// ponytail: stays for the whole session; per-match reset needs match-end detection (phase 1)
+			const bool held = (in[p] >> (DN_BIT_HOTKEY + b)) & 1;
+			const ULONGLONG now = GetTickCount64();
+			if (held) gAssistSeen[p][b] = now;
+			if (held != gAssistOn[p][b] && (held || now - gAssistSeen[p][b] > 250)) {
+				gAssistOn[p][b] = held;
+				char a[80];
+				sprintf(a, "{\"ev\":\"assist\",\"player\":%d,\"kind\":\"%s\",\"on\":%d}", p + 1, b ? "turbo" : "hotkey", held ? 1 : 0);
+				DnEmit(a);
+			}
+			if (gBadge[p][b] || !held) continue;
+			gBadge[p][b] = true;	// for this game process, which is one match (a new match starts a new one)
 			char j[80];
 			sprintf(j, "{\"ev\":\"badge\",\"player\":%d,\"kind\":\"%s\"}", p + 1, b ? "turbo" : "hotkey");
 			DnEmit(j);

@@ -229,6 +229,24 @@ std::vector<int> DnJsonInts(const std::string& s, const char* key)
 	return v;
 }
 
+// The rectangles the lobby draws over the game in (pixels of the game window): cut out of the window's region, so the
+// lobby page under the game window shows through. Applied again whenever the window is placed.
+static std::vector<int> gHoles;
+static void DnApplyHoles()
+{
+	if (!gParent || !hScrnWnd) return;
+	if (gHoles.size() < 4) { SetWindowRgn(hScrnWnd, NULL, TRUE); return; }
+	RECT wr;
+	GetClientRect(hScrnWnd, &wr);
+	HRGN rgn = CreateRectRgn(0, 0, wr.right, wr.bottom);
+	for (size_t i = 0; i + 3 < gHoles.size(); i += 4) {
+		HRGN hole = CreateRectRgn(gHoles[i], gHoles[i + 1], gHoles[i] + gHoles[i + 2], gHoles[i + 1] + gHoles[i + 3]);
+		CombineRgn(rgn, rgn, hole, RGN_DIFF);
+		DeleteObject(hole);
+	}
+	SetWindowRgn(hScrnWnd, rgn, TRUE);	// the window owns rgn from here
+}
+
 bool DnStdinClosed()
 {
 	EnterCriticalSection(&gLock);
@@ -262,7 +280,12 @@ bool DnIpcPoll()
 			if (JsonInt(l, "x", x) && JsonInt(l, "y", y) && JsonInt(l, "w", w) && JsonInt(l, "h", h) && w > 0 && h > 0) {
 				SetRect(&gRect, x, y, x + w, y + h);
 				if (gParent && hScrnWnd) SetWindowPos(hScrnWnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE);
+				DnApplyHoles();
 			}
+		}
+		if (l.find("\"cmd\":\"holes\"") != std::string::npos) {
+			gHoles = DnJsonInts(l, "r");
+			DnApplyHoles();
 		}
 	}
 

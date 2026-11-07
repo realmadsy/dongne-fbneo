@@ -4513,6 +4513,10 @@ int ScrnSize()
 		miDn.cbSize = sizeof(miDn);
 		GetMonitorInfo(MonitorFromWindow(DnParentWnd(), MONITOR_DEFAULTTOPRIMARY), &miDn);
 		SystemWorkArea = miDn.rcMonitor;
+		// and the screen ratio from the same rect, so the two cancel: pixels are square, the picture keeps the game's own
+		// shape on any monitor. A saved 16:9 against a portrait monitor squashed it to (9/16)^2.
+		nVidScrnAspectX = nVidVerScrnAspectX = SystemWorkArea.right - SystemWorkArea.left;
+		nVidScrnAspectY = nVidVerScrnAspectY = SystemWorkArea.bottom - SystemWorkArea.top;
 		SetWindowPos(hScrnWnd, HWND_TOP, rcDn.left, rcDn.top, rcDn.right - rcDn.left, rcDn.bottom - rcDn.top, SWP_NOACTIVATE);
 		return 0;
 	}
