@@ -16,6 +16,8 @@ struct DnArgs {
 	bool practice = false;	// --practice 1: alone, no session; SF2 Dash's other fighter follows the panel, KOF '98 opens its own practice mode
 	std::string practiceSet;	// --practice-set: the settings to start with, as in the "practice" command
 	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
+	std::vector<int> seats;	// --seats 2,1: the player number of each room player (room order) to start with; default 1, 2, ...
+	bool seatRestart = false;	// --seat-restart 1: a fighting game: seats never swap in play, an agreed swap is reported to restart with
 	bool freeCoin = false;	// --free-coin 1: the coin key works and start is only start (tools/latency.ps1 times the coin key)
 	unsigned int seed = 1;
 	HWND parent = NULL;
@@ -47,6 +49,7 @@ INT32 InputReadSwitch(const INT32 nCode);
 bool DnTryMain(const wchar_t* cmdline, int& exitCode);	// true: fully handled (synctest, bad args); false: continue normal init
 int DnRun(const DnArgs& a);
 void DnSetKeymap(const std::string& line);	// {"cmd":"keymap","up":[200,16386],...,"fire1":[44]}: codes per role (keyboard DIK / FBNeo joystick)
+void DnSetSeat(const std::string& line);	// {"cmd":"seat","to":3}: move to that player number if nobody holds it
 void DnSetPractice(const std::string& line);	// {"cmd":"practice","move":0,"guard":0,"stun":1}
 void DnSetHotkeys(const std::string& line);	// {"cmd":"hotkeys","hk":[code,mask,turbo,...]}: mask bit 0 = fire 1, turbo = period in frames or 0
 

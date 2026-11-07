@@ -70,6 +70,11 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		else if (k == L"--test-start") ok = ParseInt(v, 1, 100000000, a.testStart);
 		else if (k == L"--test-crash") ok = ParseInt(v, 1, 1, a.testCrash);
 		else if (k == L"--free-coin") a.freeCoin = wcscmp(v, L"1") == 0;
+		else if (k == L"--seat-restart") a.seatRestart = wcscmp(v, L"1") == 0;
+		else if (k == L"--seats") {
+			a.seats.clear();
+			for (const wchar_t* c = v; *c; c++) if (*c >= L'1' && *c <= L'4') a.seats.push_back(*c - L'0');
+		}
 		else if (k == L"--fast-start") a.fastStart = wcscmp(v, L"1") == 0;
 		else if (k == L"--practice") a.practice = wcscmp(v, L"1") == 0;
 		else if (k == L"--practice-set") a.practiceSet = Narrow(v);

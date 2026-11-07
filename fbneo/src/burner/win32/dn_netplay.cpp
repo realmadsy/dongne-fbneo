@@ -9,6 +9,7 @@
 
 static GGPOSession* gSession = NULL;
 static int gPlayers = 2;
+static DnArgs gArgs;
 static std::vector<UINT32> gPlayerInp[GGPO_MAX_PLAYERS];	// driver input indices per player, bit k = gPlayerInp[p][k]
 static std::vector<UINT32> gOtherDigital;					// reset/service/... : always forced to 0
 
@@ -26,6 +27,19 @@ static std::vector<int> gBitRole;		// role of bit k in the local player's word, 
 // Flags riding along in every player's word, so all peers can show them next to the player: which controller
 // the key settings use (28 keyboard, 29 joystick) and the badges (30 hotkey, 31 turbo). Drivers get bits 0-27.
 enum { DN_BIT_KEYBOARD = 28, DN_BIT_JOYSTICK = 29, DN_BIT_HOTKEY = 30, DN_BIT_TURBO = 31, DN_GAME_BITS = 0x0FFFFFFF };
+// Seats: participant p (room seat order) drives game player gSeat[p]. A word asks to move with bit 26 and the wanted player
+// (0-3) in bits 24-25. Every PC applies the requests in participant order on the same frame and keeps the table in the saved
+// state, so a move survives rollbacks the same everywhere. Inputs use bits 0-23 at most.
+enum { DN_SEAT_SHIFT = 24, DN_SEAT_FLAG = 1u << 26, DN_SEAT_BITS = 7u << 24, DN_MAX_INPUTS = 24, DN_SEAT_WANT_FRAMES = 120 };
+static int gSlots = 2;						// the game's player numbers
+static UINT8 gSeat[GGPO_MAX_PLAYERS] = { 0, 1, 2, 3 };
+static UINT8 gSeatShown[GGPO_MAX_PLAYERS] = { 0xFF, 0xFF, 0xFF, 0xFF };
+static int gSeatWant = -1, gSeatWantFrames = 0;	// this PC's own request, held until it takes or times out
+// Asking for a seat someone holds waits for their yes (10 s); a yes is held long enough to meet the ask (2 s).
+enum { DN_SEAT_ASK_FRAMES = 600, DN_SEAT_YES_FRAMES = 120 };
+static int gAsk[GGPO_MAX_PLAYERS] = { -1, -1, -1, -1 }, gAskShown[GGPO_MAX_PLAYERS] = { -2, -2, -2, -2 };	// seat each room player is asking for
+static bool gSwapAsked = false;			// a fighting game: an agreed swap, reported once, for the lobby to restart with
+static UINT8 gSwapNext[GGPO_MAX_PLAYERS];
 static bool gBadge[GGPO_MAX_PLAYERS][2];
 static int gCtrl[GGPO_MAX_PLAYERS] = { -1, -1, -1, -1 };
 static uint32_t gCtrlBits = 1u << DN_BIT_KEYBOARD;	// FBNeo's own mapping (keyboard) until the lobby sends one
@@ -50,7 +64,7 @@ static void DnBuildInputMap(int players)
 		memset(&bii, 0, sizeof(bii));
 		if (BurnDrvGetInputInfo(&bii, i) || bii.pVal == NULL || bii.nType != BIT_DIGITAL || bii.szName == NULL) continue;
 		int p = (bii.szName[0] == 'P' && bii.szName[1] >= '1' && bii.szName[1] <= '4' && bii.szName[2] == ' ') ? bii.szName[1] - '1' : -1;
-		if (p >= 0 && p < players && gPlayerInp[p].size() < 28) gPlayerInp[p].push_back(i);
+		if (p >= 0 && p < players && gPlayerInp[p].size() < DN_MAX_INPUTS) gPlayerInp[p].push_back(i);
 		else gOtherDigital.push_back(i);
 	}
 
@@ -77,9 +91,38 @@ static void DnApplyConstants()
 static void DnApplyInputs(const uint32_t* in)
 {
 	struct BurnInputInfo bii;
+	int want[GGPO_MAX_PLAYERS];
 	for (int p = 0; p < gPlayers; p++) {
-		for (size_t k = 0; k < gPlayerInp[p].size(); k++) {
-			BurnDrvGetInputInfo(&bii, gPlayerInp[p][k]);
+		want[p] = (in[p] & DN_SEAT_FLAG) ? (int)((in[p] >> DN_SEAT_SHIFT) & 3) : -1;
+		if (want[p] >= gSlots || want[p] == gSeat[p]) want[p] = -1;
+	}
+	// Both asking for each other's seat on the same frame is the holder's yes: they swap. A fighting game doesn't swap in
+	// play: it reports the swap once and the lobby starts the match again with it.
+	for (int p = 0; p < gPlayers; p++) {
+		for (int q = p + 1; q < gPlayers; q++) {
+			if (want[p] < 0 || want[p] != gSeat[q] || want[q] != gSeat[p]) continue;
+			if (gArgs.seatRestart) {
+				if (!gSwapAsked) { memcpy(gSwapNext, gSeat, sizeof(gSeat)); gSwapNext[p] = gSeat[q]; gSwapNext[q] = gSeat[p]; gSwapAsked = true; }
+			} else {
+				const UINT8 t = gSeat[p]; gSeat[p] = gSeat[q]; gSeat[q] = t;
+			}
+			want[p] = want[q] = -1;
+		}
+	}
+	// A free seat is taken at once, in room order (co-op games; a fighting game has every seat filled)
+	for (int p = 0; p < gPlayers; p++) {
+		bool taken = want[p] < 0 || gArgs.seatRestart;
+		for (int q = 0; q < gPlayers; q++) taken = taken || gSeat[q] == want[p];
+		if (!taken) { gSeat[p] = (UINT8)want[p]; want[p] = -1; }
+	}
+	for (int p = 0; p < gPlayers; p++) gAsk[p] = want[p];	// what is left: asking for a seat someone holds
+	for (int s = 0; s < gSlots; s++) {		// a free seat presses nothing
+		for (size_t k = 0; k < gPlayerInp[s].size(); k++) { BurnDrvGetInputInfo(&bii, gPlayerInp[s][k]); *bii.pVal = 0; }
+	}
+	for (int p = 0; p < gPlayers; p++) {
+		const int s = gSeat[p];
+		for (size_t k = 0; k < gPlayerInp[s].size(); k++) {
+			BurnDrvGetInputInfo(&bii, gPlayerInp[s][k]);
 			*bii.pVal = (in[p] >> k) & 1;
 		}
 	}
@@ -121,7 +164,6 @@ enum { DN_ROLE_START = 4, DN_COIN_FRAMES = 6, DN_START_AT = 90, DN_START_END = 9
 static uint32_t gCoinMask = 0;		// the local player's coin bit(s)
 static int gStartStep = -1;
 static bool gStartWasDown = false;
-static DnArgs gArgs;
 static int gFrame = 0;
 extern int nVidSDisplayStatus;	// vid_directx_support.cpp
 
@@ -222,7 +264,7 @@ static int DnStateSize()
 	gScanLen = 0;
 	BurnAcb = DnLenAcb;
 	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_READ, NULL);
-	return gScanLen + (int)sizeof(UINT32);
+	return gScanLen + (int)sizeof(UINT32) + (int)sizeof(gSeat);
 }
 
 static uint32_t Fnv1a(const UINT8* p, int n)
@@ -238,7 +280,8 @@ static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 	UINT8* buf = (UINT8*)malloc(n);
 	if (!buf) return false;
 	memcpy(buf, &nCurrentFrame, sizeof(UINT32));	// not part of the driver scan, but drivers read it
-	gScanPtr = buf + sizeof(UINT32);
+	memcpy(buf + sizeof(UINT32), gSeat, sizeof(gSeat));
+	gScanPtr = buf + sizeof(UINT32) + sizeof(gSeat);
 	BurnAcb = DnReadAcb;
 	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_READ, NULL);
 	*buffer = buf;
@@ -250,13 +293,72 @@ static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 static bool __cdecl cbLoad(unsigned char* buffer, int)
 {
 	memcpy(&nCurrentFrame, buffer, sizeof(UINT32));
-	gScanPtr = buffer + sizeof(UINT32);
+	memcpy(gSeat, buffer + sizeof(UINT32), sizeof(gSeat));
+	gScanPtr = buffer + sizeof(UINT32) + sizeof(gSeat);
 	BurnAcb = DnWriteAcb;
 	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_WRITE, NULL);
 	return true;
 }
 
 static void __cdecl cbFree(void* buffer) { free(buffer); }
+
+static void DnEmitAsks()
+{
+	if (!memcmp(gAsk, gAskShown, sizeof(int) * gPlayers)) return;
+	memcpy(gAskShown, gAsk, sizeof(int) * gPlayers);
+	char j[200];
+	int n = sprintf(j, "{\"ev\":\"asks\",\"asks\":[");
+	bool first = true;
+	for (int p = 0; p < gPlayers; p++) {
+		if (gAsk[p] < 0) continue;
+		n += sprintf(j + n, "%s{\"from\":%d,\"to\":%d}", first ? "" : ",", gSeat[p] + 1, gAsk[p] + 1);
+		first = false;
+	}
+	sprintf(j + n, "]}");
+	DnEmit(j);
+}
+
+static void DnEmitSeats()
+{
+	static bool swapShown = false;
+	if (gSwapAsked && !swapShown) {
+		swapShown = true;
+		char j[80];
+		int n = sprintf(j, "{\"ev\":\"swap\",\"seats\":[");
+		for (int p = 0; p < gPlayers; p++) n += sprintf(j + n, p ? ",%d" : "%d", gSwapNext[p] + 1);
+		sprintf(j + n, "]}");
+		DnEmit(j);
+	}
+	DnEmitAsks();
+	if (!memcmp(gSeat, gSeatShown, gPlayers)) return;
+	memcpy(gSeatShown, gSeat, gPlayers);
+	char j[96];
+	int n = sprintf(j, "{\"ev\":\"seats\",\"slots\":%d,\"seats\":[", gSlots);
+	for (int p = 0; p < gPlayers; p++) n += sprintf(j + n, p ? ",%d" : "%d", gSeat[p] + 1);
+	sprintf(j + n, "]}");
+	DnEmit(j);
+}
+
+void DnSetSeat(const std::string& line)	// {"cmd":"seat","to":N}: move to player N if it is free
+{
+	std::vector<int> v = DnJsonInts(line, "to");
+	if (v.size() == 1 && v[0] == 0) { gSeatWant = -1; return; }	// "to":0 takes the ask back
+	if (v.size() != 1 || v[0] < 1 || v[0] > gSlots) return;
+	gSeatWant = v[0] - 1;
+	gSeatWantFrames = DN_SEAT_ASK_FRAMES;
+	const int me = gArgs.me > 0 ? gArgs.me - 1 : 0;
+	for (int q = 0; q < gPlayers; q++) {
+		if (gSeat[q] == gSeatWant && gAsk[q] == gSeat[me]) gSeatWantFrames = DN_SEAT_YES_FRAMES;	// a yes to their ask
+	}
+}
+
+static uint32_t DnWithSeatRequest(uint32_t local)
+{
+	local &= ~DN_SEAT_BITS;
+	if (gSeatWant < 0) return local;
+	if (gSeat[gArgs.me > 0 ? gArgs.me - 1 : 0] == gSeatWant || --gSeatWantFrames < 0) { gSeatWant = -1; return local; }
+	return local | DN_SEAT_FLAG | ((uint32_t)gSeatWant << DN_SEAT_SHIFT);
+}
 static bool __cdecl cbLog(char*, unsigned char*, int) { return true; }
 static bool __cdecl cbBegin(const char*) { return true; }
 
@@ -345,6 +447,7 @@ static int DnSyncTest(const DnArgs& a)
 		int disconnect = 0;
 		if (GGPO_SUCCEEDED(ggpo_synchronize_input(gSession, in, sizeof(uint32_t) * gPlayers, &disconnect))) {
 			DnApplyInputs(in);
+			DnEmitSeats();
 			DnStepFrame(false);
 			ggpo_advance_frame(gSession);
 		}
@@ -410,7 +513,16 @@ static int DnLoadGame(const DnArgs& a)
 	InpDIPSWResetDIPs();	// driver default DIPs on every peer, whatever the local config says
 	DnApplyConstants();
 	gPlayers = a.players;
-	DnBuildInputMap(gPlayers);
+	gSlots = BurnDrvGetMaxPlayers();
+	if (gSlots < gPlayers) gSlots = gPlayers;
+	if (gSlots > GGPO_MAX_PLAYERS) gSlots = GGPO_MAX_PLAYERS;
+	if ((int)a.seats.size() == gPlayers) {
+		bool ok = true;
+		for (int p = 0; p < gPlayers; p++) for (int q = 0; q < p; q++) ok = ok && a.seats[p] != a.seats[q];
+		for (int p = 0; ok && p < gPlayers; p++) ok = a.seats[p] >= 1 && a.seats[p] <= gSlots;
+		for (int p = 0; ok && p < gPlayers; p++) gSeat[p] = (UINT8)(a.seats[p] - 1);
+	}
+	DnBuildInputMap(gSlots);
 	return 0;
 }
 
@@ -633,7 +745,7 @@ static uint32_t DnBotInput()
 	static uint32_t v = 0;
 	static int hold = 0, coinFrames = 0, coinWait = 0;
 	if (!gAutoHuman || --hold <= 0) {
-		v = XorShift(gAutoRng) & DN_GAME_BITS & (gAutoHuman ? ~gCoinMask : ~0u);
+		v = XorShift(gAutoRng) & DN_GAME_BITS & ~DN_SEAT_BITS & (gAutoHuman ? ~gCoinMask : ~0u);
 		hold = 4 + XorShift(gAutoRng) % 12;
 	}
 	if (!gAutoHuman) return v;
@@ -669,6 +781,8 @@ void DnFrameLog(char kind)
 static const struct { const char* game; int coin1, coin2, start1, start2, skip, end; } kFastStart[] = {
 	{ "sf2ce", 900, 915, 1000, 1060, 0, 1120 },
 	{ "kof98", 720, 740, 820, 880, 960, 1000 },
+	{ "wofj", 99999, 99999, 99999, 99999, 0, 500 },	// co-op: boot and warning skipped, on the title; everyone joins with their own start
+	{ "machbrkr", 99999, 99999, 99999, 99999, 0, 150 },	// co-op: only the self test is skipped; everyone joins with their own start (coin + start)
 };
 
 // KOF '98's own PRACTICE, only in its home version: the standard file on the home BIOS (AES World: English). This opens on team select.
@@ -1145,6 +1259,7 @@ int DnNetGetInput()
 		}
 	}
 	uint32_t local = !gArgs.script.empty() ? DnScriptInput(gArgs.script, gFrame) | gCtrlBits : gAutoRng ? DnBotInput() : ((DnInputOn() ? DnPackLocalInput(DnHasInputFocus()) : 0) | gCtrlBits);	// the controller shows either way
+	local = DnWithSeatRequest(local);
 	if (gArgs.practice) DnPracticeInput(local, gFrame);
 	if (gArgs.practice && gArgs.game == "sf2ce") {
 		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
@@ -1154,6 +1269,7 @@ int DnNetGetInput()
 	}
 	if (gAlone) {
 		DnApplyInputs(&local);
+		DnEmitSeats();
 		return 0;
 	}
 	if (!GGPO_SUCCEEDED(ggpo_add_local_input(gSession, gLocal, &local, sizeof(local)))) {	// not synchronized yet, or too far ahead of the peer's input
@@ -1165,6 +1281,7 @@ int DnNetGetInput()
 	int disconnect = 0;
 	if (!GGPO_SUCCEEDED(ggpo_synchronize_input(gSession, in, sizeof(uint32_t) * gPlayers, &disconnect))) return 1;
 	DnApplyInputs(in);
+	DnEmitSeats();
 	return 0;
 }
 
@@ -1268,7 +1385,8 @@ static int DnPads()
 }
 
 // dn:roms - no game loaded: the files a game needs, from FBNeo's own list, for the lobby to check a folder against.
-// ponytail: a clone's files in its parent's zip aren't told apart; the two games we offer have no parent. Add it with the first that does.
+// A clone's files that its parent has too (same CRC) are listed in the parent's zip: that is where a split set keeps them
+// (packs and MAME-style sets), and FBNeo finds them there. Its own files stay in its zip.
 static int DnRoms(const DnArgs& a)
 {
 	DnIpcStart(NULL);
@@ -1279,6 +1397,17 @@ static int DnRoms(const DnArgs& a)
 		DnEmitDrain(500);
 		BurnLibExit();
 		return DN_EXIT_OTHER;
+	}
+	std::vector<UINT32> parentCrcs;
+	const char* parent = (nBurnDrvActive = nGame, BurnDrvGetTextA(DRV_PARENT));
+	const int nParent = parent ? BurnDrvGetIndex((char*)parent) : -1;
+	if (nParent >= 0) {
+		nBurnDrvActive = nParent;
+		for (UINT32 i = 0; i < 0x80; i++) {
+			struct BurnRomInfo ri;
+			memset(&ri, 0, sizeof(ri));
+			if (BurnDrvGetRomInfo(&ri, i) == 0 && ri.nLen && ri.nCrc) parentCrcs.push_back(ri.nCrc);
+		}
 	}
 	nBurnDrvActive = nGame;
 	std::vector<std::string> zips;
@@ -1295,7 +1424,9 @@ static int DnRoms(const DnArgs& a)
 		if (BurnDrvGetRomInfo(&ri, i) || !ri.nLen || (ri.nType & (BRF_OPT | BRF_NODUMP)) || BurnDrvGetRomName(&romName, i, 0) || !romName) continue;
 		char crc[16];
 		sprintf(crc, "%08x", ri.nCrc);
-		j += std::string(first ? "" : ",") + "{\"zip\":\"" + (i < 0x80 ? zips.front() : zips.back()) + "\",\"name\":\"" + romName + "\",\"crc\":\"" + crc + "\"}";
+		const bool shared = i < 0x80 && zips.size() > 1 && std::find(parentCrcs.begin(), parentCrcs.end(), ri.nCrc) != parentCrcs.end();
+		const std::string& zip = i >= 0x80 ? zips.back() : shared ? zips[1] : zips.front();
+		j += std::string(first ? "" : ",") + "{\"zip\":\"" + zip + "\",\"name\":\"" + romName + "\",\"crc\":\"" + crc + "\"}";
 		first = false;
 	}
 	j += "]}";
