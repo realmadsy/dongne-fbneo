@@ -49,6 +49,7 @@ INT32 InputReadSwitch(const INT32 nCode);
 bool DnTryMain(const wchar_t* cmdline, int& exitCode);	// true: fully handled (synctest, bad args); false: continue normal init
 int DnRun(const DnArgs& a);
 void DnSetKeymap(const std::string& line);	// {"cmd":"keymap","up":[200,16386],...,"fire1":[44]}: codes per role (keyboard DIK / FBNeo joystick)
+void DnSetDelay(const std::string& line);	// {"cmd":"delay","frames":2}: the lobby sets the frame delay
 void DnSetSeat(const std::string& line);	// {"cmd":"seat","to":3}: move to that player number if nobody holds it
 void DnSetPractice(const std::string& line);	// {"cmd":"practice","move":0,"guard":0,"stun":1}
 void DnSetHotkeys(const std::string& line);	// {"cmd":"hotkeys","hk":[code,mask,turbo,...]}: mask bit 0 = fire 1, turbo = period in frames or 0

@@ -1253,12 +1253,17 @@ int DnNetGetInput()
 	if (gArgs.testCrash) *(volatile int*)0 = 0;
 	static bool fastStarted = false;
 	if (gArgs.fastStart && !fastStarted) { fastStarted = true; DnFastStart(); }	// before GGPO saves its first frame
-	if (gFramesAhead > 0) {	// GGPO says we're ahead of the peer: hold this frame
+	// GGPO says we're ahead of the peer by gFramesAhead frames: pay it back one held frame at a time, at least
+	// 10 frames apart. Holding them all in a row froze the picture for 50-70 ms (measured with tools/netsim.js).
+	static int sinceHold = 0;
+	if (gFramesAhead > 0 && sinceHold >= 10) {
 		gFramesAhead--;
 		gHeldFrames++;
+		sinceHold = 0;
 		DnFrameLog('h');
 		return 1;
 	}
+	sinceHold++;
 	if (gArgs.testStart && gCreditAddr) {
 		static int lastCredits = -1;
 		int credits = (int)ReadValueAtHardwareAddress(gCreditAddr, 1, 0);
@@ -1306,17 +1311,32 @@ void DnNetAdvanceFrame()
 	if (gArgs.frames && gFrame >= gArgs.frames) DnEnd("frames");
 }
 
-// --delay auto: play at 0, and once a few seconds of ping are in, take the smallest delay that keeps rollbacks
-// within DN_ROLLBACK_BUDGET frames: 0 for nearby players, more across oceans, instead of one number for everyone.
-// ponytail: chosen once per session; re-tuning mid-match (GGPO allows it) waits for real-world ping data.
-enum { DN_ROLLBACK_BUDGET = 4, DN_AUTO_SAMPLES = 3, DN_MAX_AUTO_DELAY = 6 };
-static int gAutoPings[DN_AUTO_SAMPLES], gAutoCount = 0;
+// --delay auto: play at 0, and once a few seconds of ping are in, delay by half the round trip rounded to frames
+// (GGPO's ping, which counts frame boundaries too: 33 ms -> 1, 50 -> 2, 100 -> 3). The other player's input then
+// arrives about when it is needed, and rollback only covers the jitter. Delay 0 with rollback budget 4 (before
+// 2026-11-09) rolled back on nearly every change of input, which friends felt as jumping. The lobby can still set it.
+// the first seconds of a session ping low or high while GGPO settles: skip them, then take the middle of five
+enum { DN_AUTO_SKIP = 3, DN_AUTO_SAMPLES = 5, DN_MAX_AUTO_DELAY = 6 };
+static int gAutoPings[DN_AUTO_SAMPLES], gAutoCount = 0, gAutoSkipped = 0;
 
 static int DnAutoDelay(int pingMs)
 {
-	int oneWayFrames = (pingMs * 60 / 2 + 999) / 1000;		// ping is the round trip; 60 frames a second
-	int d = oneWayFrames - DN_ROLLBACK_BUDGET;
+	int d = (pingMs * 60 / 2 + 500) / 1000;		// half the round trip, in frames of 1/60 s, rounded
 	return d < 0 ? 0 : d > DN_MAX_AUTO_DELAY ? DN_MAX_AUTO_DELAY : d;
+}
+
+// The lobby's own choice ({"cmd":"delay","frames":n}): taken at once, and auto stops choosing.
+void DnSetDelay(const std::string& line)
+{
+	extern std::vector<int> DnJsonInts(const std::string& s, const char* key);
+	std::vector<int> v = DnJsonInts(line, "frames");
+	if (v.empty() || !gSession) return;
+	int d = v[0] < 0 ? 0 : v[0] > DN_MAX_AUTO_DELAY ? DN_MAX_AUTO_DELAY : v[0];
+	ggpo_set_frame_delay(gSession, gLocal, d);
+	gAutoCount = DN_AUTO_SAMPLES;	// auto is done
+	char j[64];
+	sprintf(j, "{\"ev\":\"delay\",\"frames\":%d,\"auto\":false}", d);
+	DnEmit(j);
 }
 
 void DnNetIdle()
@@ -1342,7 +1362,7 @@ void DnNetIdle()
 	gRollbackFrames = 0;
 	gHeldFrames = gStalledFrames = 0;
 
-	if (gArgs.delay < 0 && gAutoCount < DN_AUTO_SAMPLES && worstPing >= 0) {
+	if (gArgs.delay < 0 && gAutoCount < DN_AUTO_SAMPLES && worstPing >= 0 && gAutoSkipped++ >= DN_AUTO_SKIP) {
 		gAutoPings[gAutoCount++] = worstPing;
 		if (gAutoCount == DN_AUTO_SAMPLES) {
 			std::sort(gAutoPings, gAutoPings + DN_AUTO_SAMPLES);

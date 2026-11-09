@@ -275,6 +275,7 @@ bool DnIpcPoll()
 		if (l.find("\"cmd\":\"hotkeys\"") != std::string::npos) DnSetHotkeys(l);
 		if (l.find("\"cmd\":\"practice\"") != std::string::npos) DnSetPractice(l);
 		if (l.find("\"cmd\":\"seat\"") != std::string::npos) DnSetSeat(l);
+		if (l.find("\"cmd\":\"delay\"") != std::string::npos) DnSetDelay(l);
 		if (l.find("\"cmd\":\"rect\"") != std::string::npos) {
 			int x, y, w, h;
 			if (JsonInt(l, "x", x) && JsonInt(l, "y", y) && JsonInt(l, "w", w) && JsonInt(l, "h", h) && w > 0 && h > 0) {
