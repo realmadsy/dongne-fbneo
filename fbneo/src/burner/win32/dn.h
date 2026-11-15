@@ -8,15 +8,20 @@ struct DnPeer { int player; std::string ip; int port; };
 
 struct DnArgs {
 	std::string mode, game, autoInput;
-	std::wstring rompath, soundDump, frameLog, dump;	// dump (dn:practice): both SF2 fighters' memory, 0x600 bytes a frame (tests)	// soundDump: raw 16-bit stereo, one block per emulated frame (tests). frameLog: see DnFrameLog
+	std::wstring rompath, soundDump, frameLog, dump, ips;	// ips: a patch .dat (FBNeo's IPS format); its .ips files sit beside it	// dump (dn:practice): both SF2 fighters' memory, 0x600 bytes a frame (tests)	// soundDump: raw 16-bit stereo, one block per emulated frame (tests). frameLog: see DnFrameLog
 	int players = 2, me = 1, localPort = 7000, delay = 2, frames = 0;	// delay -1 = auto (--delay auto)
 	int testStart = 0;		// --test-start <frame>: acts as if the start key went down at that frame, and reports the credits (tests)
 	int testCrash = 0;		// --test-crash 1: crashes on the first input read (tests)
+	int testSlow = 0;		// --test-slow <ms>: every 30th frame takes that much longer, like a slow PC re-running frames (tools/netsim.js --slow)
+	int boutEnd = 0;		// --bout-end n: the team relay - the game ends n frames after a bout is told (the win pose shows)
+	bool feed = false;		// --feed 1: alone (playing while the room waits), still send out the inputs for spectators
+	bool watch = false;		// --watch 1: a spectator: no session, the players' confirmed inputs come from the lobby ({"cmd":"feed"})
 	bool fastStart = false;	// --fast-start 1: skip the boot, open on character select (DnFastStart)
 	bool practice = false;	// --practice 1: alone, no session; SF2 Dash's other fighter follows the panel, KOF '98 opens its own practice mode
 	std::string practiceSet;	// --practice-set: the settings to start with, as in the "practice" command
 	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
 	std::vector<int> seats;	// --seats 2,1: the player number of each room player (room order) to start with; default 1, 2, ...
+	bool runAhead = false;		// --runahead 1: show the frame after the real one (this player's screen only)
 	bool seatRestart = false;	// --seat-restart 1: a fighting game: seats never swap in play, an agreed swap is reported to restart with
 	bool freeCoin = false;	// --free-coin 1: the coin key works and start is only start (tools/latency.ps1 times the coin key)
 	unsigned int seed = 1;
@@ -49,7 +54,14 @@ INT32 InputReadSwitch(const INT32 nCode);
 bool DnTryMain(const wchar_t* cmdline, int& exitCode);	// true: fully handled (synctest, bad args); false: continue normal init
 int DnRun(const DnArgs& a);
 void DnSetKeymap(const std::string& line);	// {"cmd":"keymap","up":[200,16386],...,"fire1":[44]}: codes per role (keyboard DIK / FBNeo joystick)
+bool DnRunAheadOn();					// run.cpp: lobby mode with --runahead 1 (and a game that allows it)
+void DnRunAheadSave();					// run.cpp: the whole state, as rollback saves it
+void DnRunAheadLoad();
 void DnSetDelay(const std::string& line);	// {"cmd":"delay","frames":2}: the lobby sets the frame delay
+void DnSnapAsk();	// {"cmd":"snap"}: a player's newest final state, for a late spectator
+void DnWatchState(const std::string& line);	// {"cmd":"state","d":base64}: a spectator starts from it
+void DnWatchFeed(const std::string& line);	// {"cmd":"feed","from":f,"d":"n:w.w,...","h":"f:h,..."}: a spectator's next inputs (see dn_netplay.cpp)
+void DnSetVolume(const std::string& line);	// {"cmd":"volume","v":0-100}: the game's sound, from the lobby's slider
 void DnSetSeat(const std::string& line);	// {"cmd":"seat","to":3}: move to that player number if nobody holds it
 void DnSetPractice(const std::string& line);	// {"cmd":"practice","move":0,"guard":0,"stun":1}
 void DnSetHotkeys(const std::string& line);	// {"cmd":"hotkeys","hk":[code,mask,turbo,...]}: mask bit 0 = fire 1, turbo = period in frames or 0

@@ -566,6 +566,7 @@ void SetGfxMapper(INT32 MapperId)
 			return;
 		}
 		
+
 		case mapper_FFIGHTEX: {
 			GfxBankSizes[0] = 0x10000;
 			GfxBankSizes[1] = 0x08000;

@@ -285,6 +285,82 @@ static uint32_t Fnv1a(const UINT8* p, int n)
 	return h;
 }
 
+// Run-ahead (run.cpp): the real frame is run unseen, the state kept, the next frame run and shown, the state put back.
+// The whole state, as cbSave keeps it: a smaller save would let the shown frame leave traces in the real game.
+static std::vector<UINT8> gAheadState;
+bool DnRunAheadOn() { return gArgs.runAhead && bDrvOkay && !(BurnDrvGetFlags() & BDF_RUNAHEAD_DISABLED); }
+void DnRunAheadSave()
+{
+	gAheadState.resize(DnStateSize());
+	memcpy(gAheadState.data(), &nCurrentFrame, sizeof(UINT32));
+	memcpy(gAheadState.data() + sizeof(UINT32), gSeat, sizeof(gSeat));
+	gScanPtr = gAheadState.data() + sizeof(UINT32) + sizeof(gSeat);
+	BurnAcb = DnReadAcb;
+	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_READ, NULL);
+}
+void DnRunAheadLoad()
+{
+	memcpy(&nCurrentFrame, gAheadState.data(), sizeof(UINT32));
+	memcpy(gSeat, gAheadState.data() + sizeof(UINT32), sizeof(gSeat));
+	gScanPtr = gAheadState.data() + sizeof(UINT32) + sizeof(gSeat);
+	BurnAcb = DnWriteAcb;
+	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_WRITE, NULL);
+}
+
+static void DnRecordHash(int f, uint32_t h);
+
+// ---------------------------------------------------------------- snapshots for late spectators
+// A spectator who comes in late loads a player's saved state instead of playing the whole match through: the lobby
+// asks ({"cmd":"snap"}), we answer with the newest final state ({"ev":"snap","f":frame,"d":base64}) and the room server
+// hands it on. Final: rollback saves every frame and saves one again when it re-runs it, so a copy of every 60th frame
+// is kept (the last save counts) and handed out only once the next one is saved, a second on, far past any rollback.
+// The bytes are exactly cbSave's, so the spectator's state hash check (every 300th frame) covers the load as well.
+enum { DN_SNAP_EVERY = 60 };
+static std::vector<UINT8> gSnapCand, gSnapFinal;
+static int gSnapCandF = -1, gSnapFinalF = -1;
+static LONGLONG gSnapKeepTicks = 0, gSnapKeepMax = 0, gSnapKeeps = 0;	// what keeping costs the game thread (told with each snap)
+static LONGLONG DnTicks() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static int DnMicros(LONGLONG ticks) { LARGE_INTEGER hz; QueryPerformanceFrequency(&hz); return (int)(ticks * 1000000 / hz.QuadPart); }
+static void DnSnapKeep(int f, const UINT8* buf, int n)
+{
+	if (f % DN_SNAP_EVERY) return;
+	const LONGLONG t0 = DnTicks();
+	if (f != gSnapCandF && gSnapCandF >= 0 && f > gSnapCandF) { gSnapFinal.swap(gSnapCand); gSnapFinalF = gSnapCandF; }
+	gSnapCand.assign(buf, buf + n);
+	gSnapCandF = f;
+	const LONGLONG dt = DnTicks() - t0;
+	gSnapKeepTicks += dt; gSnapKeeps++;
+	if (dt > gSnapKeepMax) gSnapKeepMax = dt;
+}
+
+static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static std::string DnB64(const UINT8* p, size_t n)
+{
+	std::string o;
+	o.reserve((n + 2) / 3 * 4);
+	for (size_t i = 0; i < n; i += 3) {
+		const uint32_t v = (uint32_t)p[i] << 16 | (i + 1 < n ? (uint32_t)p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+		o += kB64[v >> 18 & 63]; o += kB64[v >> 12 & 63];
+		o += i + 1 < n ? kB64[v >> 6 & 63] : '=';
+		o += i + 2 < n ? kB64[v & 63] : '=';
+	}
+	return o;
+}
+static std::vector<UINT8> DnUnB64(const std::string& s)
+{
+	std::vector<UINT8> o;
+	uint32_t v = 0;
+	int bits = 0;
+	for (size_t i = 0; i < s.size(); i++) {
+		const char* c = strchr(kB64, s[i]);
+		if (!c || !s[i]) continue;	// '=' and anything else
+		v = v << 6 | (uint32_t)(c - kB64);
+		bits += 6;
+		if (bits >= 8) { bits -= 8; o.push_back((UINT8)(v >> bits)); }
+	}
+	return o;
+}
+
 static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 {
 	int n = DnStateSize();
@@ -298,6 +374,7 @@ static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 	*buffer = buf;
 	*len = n;
 	*checksum = (int)Fnv1a(buf, n);
+	if (gSession) { DnRecordHash((int)nCurrentFrame, (uint32_t)*checksum); DnSnapKeep((int)nCurrentFrame, buf, n); }
 	return true;
 }
 
@@ -375,6 +452,8 @@ static bool __cdecl cbBegin(const char*) { return true; }
 
 // ---------------------------------------------------------------- frames
 
+static void DnBoutCheck();
+static int gBoutEndAt = -1;	// --bout-end: the frame the game ends on, once a bout is told
 static void DnStepFrame(bool draw)
 {
 	if (!draw) {
@@ -390,6 +469,254 @@ static void DnStepFrame(bool draw)
 	BurnDrvFrame();
 }
 
+// ---------------------------------------------------------------- spectators
+// A player's PC sends out its confirmed inputs (the lobby passes them to the room server, which hands them to the
+// spectators); a spectator (--watch) plays them back from the same start, so it sees the same match about a second
+// late, without rollback. Frames are nCurrentFrame values, the same on every PC from the first synchronized frame.
+// GGPO never runs more than 8 frames ahead of the last input it has from the other player, so a frame 30 back is final.
+// Every 300th frame also carries the hash of the state it starts from (as rollback saves it): a spectator whose own
+// differs has drifted and says so, instead of quietly showing some other match.
+// Feed text: "n:w.w,n:w.w" runs of n frames with these words (hex, one per player); hashes "f:h,f:h" (hex).
+enum { DN_FEED_MARGIN = 30, DN_FEED_EVERY = 10, DN_FEED_MAX = 600, DN_HASH_EVERY = 300 };
+static std::vector<uint32_t> gRec;		// a player: the words of frame gRecBase + i at [i * gPlayers]
+static int gRecBase = -1, gRecSent = -1;
+static std::vector<std::pair<int, uint32_t> > gRecHash;
+
+static void DnRecord(const uint32_t* in)
+{
+	const int f = (int)nCurrentFrame;
+	if (gRecBase < 0) gRecBase = gRecSent = f;
+	if (f < gRecBase) return;
+	const size_t at = (size_t)(f - gRecBase) * gPlayers;
+	if (gRec.size() < at + gPlayers) gRec.resize(at + gPlayers);
+	memcpy(&gRec[at], in, sizeof(uint32_t) * gPlayers);
+}
+
+static void DnRecordHash(int f, uint32_t h)	// rollback saves a frame again when it re-runs it: the last save counts
+{
+	if (gRecBase < 0 || f < gRecSent || f % DN_HASH_EVERY) return;
+	for (size_t i = 0; i < gRecHash.size(); i++) if (gRecHash[i].first == f) { gRecHash[i].second = h; return; }
+	gRecHash.push_back(std::make_pair(f, h));
+}
+
+static void DnEmitFeed()
+{
+	if (gRecBase < 0) return;
+	int end = (int)nCurrentFrame - DN_FEED_MARGIN;
+	if (end > gRecSent + DN_FEED_MAX) end = gRecSent + DN_FEED_MAX;
+	if (end <= gRecSent) return;
+	std::string d, h;
+	char w[24];
+	for (int f = gRecSent; f < end;) {
+		const uint32_t* a = &gRec[(size_t)(f - gRecBase) * gPlayers];
+		int n = 1;
+		while (f + n < end && !memcmp(a, &gRec[(size_t)(f + n - gRecBase) * gPlayers], sizeof(uint32_t) * gPlayers)) n++;
+		if (!d.empty()) d += ',';
+		d += std::to_string(n) + ':';
+		for (int p = 0; p < gPlayers; p++) { sprintf(w, p ? ".%x" : "%x", a[p]); d += w; }
+		f += n;
+	}
+	std::vector<std::pair<int, uint32_t> > keep;
+	for (size_t i = 0; i < gRecHash.size(); i++) {
+		if (gRecHash[i].first >= end) { keep.push_back(gRecHash[i]); continue; }
+		sprintf(w, "%s%d:%x", h.empty() ? "" : ",", gRecHash[i].first, gRecHash[i].second);
+		h += w;
+	}
+	gRecHash.swap(keep);
+	std::string j = "{\"ev\":\"feed\",\"from\":" + std::to_string(gRecSent) + ",\"d\":\"" + d + "\",\"h\":\"" + h + "\"}";
+	DnEmit(j.c_str());
+	gRecSent = end;
+}
+
+static std::vector<uint32_t> gFeed;		// a spectator: frame gFeedBase + i at [i * gPlayers]
+static int gFeedBase = -1;
+static std::vector<std::pair<int, uint32_t> > gFeedHash;
+static bool gWatchPlaying = false, gWatchDrift = false;
+static int gFeedEnd = -1;	// where the players' feed ends on the server now (the live match); -1: an older server, not told
+static int gWatchChecked = 0;
+
+static std::string DnJsonText(const std::string& s, const char* key)
+{
+	const std::string k = std::string("\"") + key + "\":\"";
+	size_t i = s.find(k);
+	if (i == std::string::npos) return "";
+	i += k.size();
+	size_t e = s.find('"', i);
+	return e == std::string::npos ? "" : s.substr(i, e - i);
+}
+
+// {"cmd":"snap"}: the newest final state, for a late spectator (f -1: none yet, or not in a match)
+void DnSnapAsk()
+{
+	if (gSnapFinalF < 0 || gArgs.watch) { DnEmit("{\"ev\":\"snap\",\"f\":-1}"); return; }
+	const LONGLONG t0 = DnTicks();
+	std::string j = "{\"ev\":\"snap\",\"f\":" + std::to_string(gSnapFinalF) + ",\"d\":\"" + DnB64(gSnapFinal.data(), gSnapFinal.size()) + "\"";
+	const int took = DnMicros(DnTicks() - t0);
+	j += ",\"us\":" + std::to_string(took) + ",\"keepUs\":" + std::to_string(gSnapKeeps ? DnMicros(gSnapKeepTicks / gSnapKeeps) : 0) + ",\"keepMaxUs\":" + std::to_string(DnMicros(gSnapKeepMax)) + ",\"keeps\":" + std::to_string((int)gSnapKeeps) + "}";
+	DnEmit(j.c_str());
+}
+
+// {"cmd":"state","d":base64}: a spectator starts from a player's snapshot instead of the first frame; the lobby sends it
+// before the feed, which then starts at the snapshot's frame. Loaded on the next frame (after the fast start, which would
+// overwrite it). A state of the wrong size (another game, another build) is refused.
+static std::vector<UINT8> gStatePending;
+void DnWatchState(const std::string& line)
+{
+	if (!gArgs.watch || gWatchPlaying) return;
+	std::vector<UINT8> b = DnUnB64(DnJsonText(line, "d"));
+	if ((int)b.size() != DnStateSize()) { DnEmitError("watch_state", "the snapshot does not fit this game"); return; }
+	gStatePending.swap(b);
+}
+
+// Feeds arrive in order from the lobby, which asks the server from the frame it has: one that doesn't join on is dropped.
+void DnWatchFeed(const std::string& line)
+{
+	std::vector<int> from = DnJsonInts(line, "from"), end = DnJsonInts(line, "end");
+	if (!end.empty() && end[0] > gFeedEnd) gFeedEnd = end[0];
+	if (from.empty()) return;
+	const int have = gFeedBase < 0 ? from[0] : gFeedBase + (int)(gFeed.size() / gPlayers);
+	if (from[0] != have) return;
+	if (gFeedBase < 0) gFeedBase = from[0];
+	const std::string d = DnJsonText(line, "d"), h = DnJsonText(line, "h");
+	for (size_t i = 0; i < d.size();) {
+		size_t e = d.find(',', i);
+		if (e == std::string::npos) e = d.size();
+		const std::string run = d.substr(i, e - i);
+		i = e + 1;
+		const size_t c = run.find(':');
+		if (c == std::string::npos) return;
+		const int n = atoi(run.c_str());
+		uint32_t w[GGPO_MAX_PLAYERS] = { 0 };
+		const char* q = run.c_str() + c + 1;
+		for (int p = 0; p < gPlayers && *q; p++) { w[p] = (uint32_t)strtoul(q, (char**)&q, 16); if (*q == '.') q++; }
+		for (int k = 0; k < n && n < 100000; k++) gFeed.insert(gFeed.end(), w, w + gPlayers);
+	}
+	for (size_t i = 0; i < h.size();) {
+		size_t e = h.find(',', i);
+		if (e == std::string::npos) e = h.size();
+		const std::string one = h.substr(i, e - i);
+		i = e + 1;
+		const size_t c = one.find(':');
+		if (c != std::string::npos) gFeedHash.push_back(std::make_pair(atoi(one.c_str()), (uint32_t)strtoul(one.c_str() + c + 1, NULL, 16)));
+	}
+}
+
+static uint32_t DnStateHash()
+{
+	unsigned char* b = NULL;
+	int n = 0, c = 0;
+	if (!cbSave(&b, &n, &c, 0)) return 0;
+	free(b);
+	return (uint32_t)c;
+}
+
+// The inputs of frame nCurrentFrame, if the feed has them; checks the state's hash where the feed has one.
+static bool DnWatchApply()
+{
+	const int f = (int)nCurrentFrame;
+	if (gFeedBase < 0 || f < gFeedBase) return false;
+	const size_t at = (size_t)(f - gFeedBase) * gPlayers;
+	if (at + gPlayers > gFeed.size()) return false;
+	for (size_t i = 0; i < gFeedHash.size(); i++) {
+		if (gFeedHash[i].first != f) continue;
+		const uint32_t mine = DnStateHash();
+		if (mine == gFeedHash[i].second) gWatchChecked++;
+		else if (!gWatchDrift) {
+			gWatchDrift = true;
+			char j[96];
+			sprintf(j, "{\"ev\":\"watch-drift\",\"frame\":%d}", f);
+			DnEmit(j);
+		}
+	}
+	DnApplyInputs(&gFeed[at]);
+	return true;
+}
+
+// What each player holds, for the spectator's input panel: direction as on a number pad (5 = none), fire buttons as bits.
+static void DnEmitWatchInputs()
+{
+	const size_t at = (size_t)((int)nCurrentFrame - gFeedBase) * gPlayers;
+	std::string j = "{\"ev\":\"watch-in\",\"frame\":" + std::to_string(gFrame) + ",\"checked\":" + std::to_string(gWatchChecked) + ",\"p\":[";
+	for (int p = 0; p < gPlayers; p++) {
+		const uint32_t w = gFeed[at + p];
+		bool up = false, down = false, left = false, right = false;
+		int fire = 0;
+		for (size_t k = 0; k < gBitRole.size(); k++) {
+			if (!((w >> k) & 1)) continue;
+			const int r = gBitRole[k];
+			if (r == 0) up = true; else if (r == 1) down = true; else if (r == 2) left = true; else if (r == 3) right = true;
+			else if (r >= 5) fire |= 1 << (r - 5);
+		}
+		const int dir = 5 + (up && !down ? 3 : down && !up ? -3 : 0) + (right && !left ? 1 : left && !right ? -1 : 0);
+		j += std::string(p ? "," : "") + std::to_string(dir) + "," + std::to_string(fire);
+	}
+	j += "]}";
+	DnEmit(j.c_str());
+}
+
+// How far this spectator is from the live match (the server's end of the feed): far behind (came in late) the lobby
+// covers the game with "따라잡는 중" while it runs ahead unseen, and uncovers it on watch-live.
+static void DnWatchBehind(int live, int f)
+{
+	static bool behind = false, live_told = false;	// (not "far": windows.h defines it away)
+	static int told = 0;
+	if (gFeedBase < 0) return;	// no feed yet: where live is comes with it
+	if (gFeedEnd < 0) { if (!live_told) { live_told = true; DnEmit("{\"ev\":\"watch-live\"}"); } return; }	// an older server: no cover
+	if (live > 120) {
+		if (!behind || ++told % 15 == 0) {
+			char j[96];
+			sprintf(j, "{\"ev\":\"watch-catchup\",\"behind\":%d,\"at\":%d,\"end\":%d}", live, f, gFeedEnd);
+			DnEmit(j);
+		}
+		behind = true;
+	} else if (behind || !live_told) {	// once caught up, and also when it came in live (the lobby covers the box until then)
+		behind = false;
+		live_told = true;
+		DnEmit("{\"ev\":\"watch-live\"}");
+	}
+}
+
+// A spectator's frame: waits for half a second of feed before it plays (and again after running dry), and when far
+// behind (joined late, or the line stalled) runs ahead unseen until a second is left.
+static int DnWatchInput()
+{
+	if (!gStatePending.empty()) {
+		cbLoad(gStatePending.data(), (int)gStatePending.size());
+		gStatePending.clear();
+		char j[64];
+		sprintf(j, "{\"ev\":\"watch-state\",\"f\":%d}", (int)nCurrentFrame);
+		DnEmit(j);
+	}
+	const int f = (int)nCurrentFrame;
+	int ahead = gFeedBase < 0 ? 0 : gFeedBase + (int)(gFeed.size() / gPlayers) - f;
+	static bool started = false;
+	if (gFeedBase >= 0 && !started) {
+		started = true;
+		if (f != gFeedBase) { gWatchDrift = true; DnEmitError("watch_start", "the feed starts on another frame than this game"); }
+	}
+	if (!gWatchPlaying && ahead < 30) { DnWatchBehind(gFeedEnd - f, f); return 1; }
+	if (ahead <= 0) { gWatchPlaying = false; DnWatchBehind(gFeedEnd - f, f); return 1; }
+	if (!gWatchPlaying) { gWatchPlaying = true; DnEmit("{\"ev\":\"watch-playing\"}"); }
+	if (ahead > 120) {	// unseen, as fast as it goes: half a minute of match a tick at most, so the lobby's lines still come in
+		int n = 0;
+		for (; ahead > 60 && n < 1800; n++, ahead--) {
+			DnWatchApply();
+			DnStepFrame(false);
+			gFrame++;
+		}
+		if (gFeedEnd < 0) {	// an older server: the lobby only hears how much of what it has is left
+			char j[64];
+			sprintf(j, "{\"ev\":\"watch-catchup\",\"behind\":%d}", ahead);
+			DnEmit(j);
+		}
+	}
+	DnWatchBehind(gFeedEnd - (int)nCurrentFrame, (int)nCurrentFrame);
+	DnWatchApply();
+	DnEmitSeats();	// who holds which player number (after a seat swap the room's order and the players' differ)
+	if (gFrame % 4 == 0) DnEmitWatchInputs();
+	return 0;
+}
+
 // Called by GGPO when it re-simulates frames during a rollback.
 static int gRollbackFrames = 0;	// re-simulated frames since the last stats line
 
@@ -399,6 +726,7 @@ static bool __cdecl cbAdvance(int)
 	uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
 	int disconnect = 0;
 	ggpo_synchronize_input(gSession, in, sizeof(uint32_t) * gPlayers, &disconnect);
+	DnRecord(in);
 	DnApplyInputs(in);
 	DnStepFrame(false);
 	ggpo_advance_frame(gSession);
@@ -460,7 +788,9 @@ static int DnSyncTest(const DnArgs& a)
 			DnApplyInputs(in);
 			DnEmitSeats();
 			DnStepFrame(false);
+			DnBoutCheck();	// tests: random inputs finish bouts too
 			ggpo_advance_frame(gSession);
+			if (gBoutEndAt >= 0 && (int)nCurrentFrame >= gBoutEndAt) { DnEmit("{\"ev\":\"ended\",\"reason\":\"bout\"}"); f++; break; }
 		}
 	}
 	ggpo_close_session(gSession);
@@ -515,9 +845,29 @@ static int DnLoadGame(const DnArgs& a)
 		DnEmitError("bad_args", ("unknown game: " + a.game).c_str());
 		return DN_EXIT_OTHER;
 	}
+	extern INT32 nEEPROMNoFile;
+	nEEPROMNoFile = 1;	// every PC starts the game with the same blank EEPROM (eeprom.cpp)
+	if (!a.ips.empty()) {	// a patch (e.g. a translation): the patcher reads <ips path><game>/<name>.ips, so that path is the
+		extern void DnIpsUse(const TCHAR*);	// .dat's folder minus the game's name; the lobby keeps them in <dir>/<game>/
+		std::wstring dir = a.ips.substr(0, a.ips.find_last_of(L"\\/") + 1);	// e.g. .../ips/ddsomu/
+		std::wstring base = dir.substr(0, dir.size() - 1);
+		base = base.substr(0, base.find_last_of(L"\\/") + 1);	// e.g. .../ips/
+		wcsncpy(szAppIpsPath, base.c_str(), MAX_PATH - 1);
+		nBurnDrvActive = nGame;	// the patcher reads the game's name and settings from the active driver
+		DnIpsUse(a.ips.c_str());
+		IpsPatchInit();
+	}
+	extern INT32 nDnIpsApplied;
+	nDnIpsApplied = 0;
 	if (DrvInit(nGame, false) || !bDrvOkay) {
 		DnEmitError("rom_missing", ("cannot load " + a.game).c_str());
 		return DN_EXIT_ROM;
+	}
+	if (!a.ips.empty()) {	// a patch asked for and nothing of it applied: this PC would play another game than the others
+		char j[64];
+		sprintf(j, "{\"ev\":\"ips\",\"applied\":%d}", nDnIpsApplied);
+		DnEmit(j);
+		if (!nDnIpsApplied) { DnEmitError("rom_missing", "the patch did not apply"); return DN_EXIT_ROM; }
 	}
 
 	DnStageEdits();
@@ -603,8 +953,13 @@ static void DnEnd(const char* reason)
 {
 	if (gEnding) return;
 	gEnding = true;
-	char j[96];
-	sprintf(j, "{\"ev\":\"ended\",\"reason\":\"%s\"}", reason);
+	char j[128];
+	if (!strcmp(reason, "frames") && bDrvOkay) {	// the state at the last frame, for tests comparing the players
+		unsigned char* buf = NULL; int len = 0, sum = 0;
+		cbSave(&buf, &len, &sum, 0);
+		free(buf);
+		sprintf(j, "{\"ev\":\"ended\",\"reason\":\"%s\",\"sum\":%u}", reason, (unsigned)sum);
+	} else sprintf(j, "{\"ev\":\"ended\",\"reason\":\"%s\"}", reason);
 	DnEmit(j);
 	PostQuitMessage(0);
 }
@@ -671,7 +1026,7 @@ int DnP2PLoad()
 
 	if ((gExitCode = DnLoadGame(gArgs)) != 0) return 1;
 
-	gAlone = gPlayers == 1 || gArgs.practice;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
+	gAlone = gPlayers == 1 || gArgs.practice || gArgs.watch;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
 	if (gArgs.practice) DnSetPractice(gArgs.practiceSet);
 	if (!gAlone) {
 		if (!DnPortFree(gArgs.localPort)) {
@@ -1251,8 +1606,10 @@ int DnNetGetInput()
 {
 	if ((!gSession && !gAlone) || gEnding) return 1;
 	if (gArgs.testCrash) *(volatile int*)0 = 0;
+	if (gArgs.testSlow && gFrame % 30 == 29) Sleep(gArgs.testSlow);
 	static bool fastStarted = false;
 	if (gArgs.fastStart && !fastStarted) { fastStarted = true; DnFastStart(); }	// before GGPO saves its first frame
+	if (gArgs.watch) return DnWatchInput();
 	// GGPO says we're ahead of the peer by gFramesAhead frames: pay it back one held frame at a time, at least
 	// 10 frames apart. Holding them all in a row froze the picture for 50-70 ms (measured with tools/netsim.js).
 	static int sinceHold = 0;
@@ -1284,6 +1641,10 @@ int DnNetGetInput()
 		return 0;
 	}
 	if (gAlone) {
+		if (gArgs.feed) {	// alone while the room waits: spectators watch this too (no rollback here, so every frame is final)
+			DnRecord(&local);
+			if ((int)nCurrentFrame % DN_HASH_EVERY == 0) DnRecordHash((int)nCurrentFrame, DnStateHash());
+		}
 		DnApplyInputs(&local);
 		DnEmitSeats();
 		return 0;
@@ -1296,23 +1657,48 @@ int DnNetGetInput()
 	uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
 	int disconnect = 0;
 	if (!GGPO_SUCCEEDED(ggpo_synchronize_input(gSession, in, sizeof(uint32_t) * gPlayers, &disconnect))) return 1;
+	DnRecord(in);
 	DnApplyInputs(in);
 	DnEmitSeats();
 	return 0;
 }
 
+// The end of a bout (a match of 2 won rounds), for the score over the game and the team relay. sf2ce keeps each
+// player's won rounds at the player block + 0x290 (1P 0xFF864E, 2P 0xFF894E; found by diffing RAM over a long random
+// match): one reaching 2 has won the bout, and both go back to 0 when the next one starts. Told once it has held for a
+// second, so a rollback can no longer take it back; spectators tell it too, from the same frames.
+static void DnBoutCheck()
+{
+	if (gArgs.game != "sf2ce" || gArgs.practice) return;
+	static int last = 0, held = 0;
+	static bool told = false;
+	const int won = ((int)ReadValueAtHardwareAddress(0xFF864E, 1, 0) >= 2 ? 1 : 0) | ((int)ReadValueAtHardwareAddress(0xFF894E, 1, 0) >= 2 ? 2 : 0);
+	if (won != last) { last = won; held = 0; }
+	if (!won) { told = false; return; }
+	if (++held == 60 && !told) {
+		told = true;
+		char j[80];
+		sprintf(j, "{\"ev\":\"bout\",\"winner\":%d,\"frame\":%d}", won == 3 ? 0 : won, (int)nCurrentFrame);	// 0: both, a draw
+		DnEmit(j);
+		if (gArgs.boutEnd) gBoutEndAt = (int)nCurrentFrame + gArgs.boutEnd;
+	}
+}
+
 void DnNetAdvanceFrame()
 {
+	DnBoutCheck();	// players, playing alone and spectators alike
+	if (gBoutEndAt >= 0 && (int)nCurrentFrame >= gBoutEndAt) { DnEnd("bout"); return; }	// every peer on the same frame
 	if (!gSession && !gAlone) return;
 	static FILE* dump = gArgs.soundDump.empty() ? NULL : _wfopen(gArgs.soundDump.c_str(), L"wb");
 	if (dump && pBurnSoundOut) fwrite(pBurnSoundOut, 4, nBurnSoundLen, dump);	// what this frame played; compared against the peer in tests
 	if (gSession) ggpo_advance_frame(gSession);
 	gFrame++;
+	if ((gSession || gArgs.feed) && gFrame % DN_FEED_EVERY == 0) DnEmitFeed();
 	if (gArgs.frames && gFrame >= gArgs.frames) DnEnd("frames");
 }
 
 // --delay auto: play at 0, and once a few seconds of ping are in, delay by half the round trip rounded to frames
-// (GGPO's ping, which counts frame boundaries too: 33 ms -> 1, 50 -> 2, 100 -> 3). The other player's input then
+// (GGPO's ping, which counts frame boundaries too: 33 ms -> 0, 50 -> 1, 100 -> 2, after the one frame less below). The other player's input then
 // arrives about when it is needed, and rollback only covers the jitter. Delay 0 with rollback budget 4 (before
 // 2026-11-09) rolled back on nearly every change of input, which friends felt as jumping. The lobby can still set it.
 // the first seconds of a session ping low or high while GGPO settles: skip them, then take the middle of five
@@ -1321,8 +1707,19 @@ static int gAutoPings[DN_AUTO_SAMPLES], gAutoCount = 0, gAutoSkipped = 0;
 
 static int DnAutoDelay(int pingMs)
 {
-	int d = (pingMs * 60 / 2 + 500) / 1000;		// half the round trip, in frames of 1/60 s, rounded
+	int d = (pingMs * 60 / 2 + 500) / 1000 - 1;	// half the round trip in frames of 1/60 s, rounded, then one less for the
+												// quickest response: rollback covers it (lobby/src/delay.js, same rule)
 	return d < 0 ? 0 : d > DN_MAX_AUTO_DELAY ? DN_MAX_AUTO_DELAY : d;
+}
+
+// The lobby's volume slider ({"cmd":"volume","v":0-100}), at once. A bot's game stays silent (see --auto-input).
+void DnSetVolume(const std::string& line)
+{
+	extern std::vector<int> DnJsonInts(const std::string& s, const char* key);
+	std::vector<int> v = DnJsonInts(line, "v");
+	if (v.empty() || !gArgs.autoInput.empty()) return;
+	nAudVolume = (v[0] < 0 ? 0 : v[0] > 100 ? 100 : v[0]) * 100;
+	AudSoundSetVolume();
 }
 
 // The lobby's own choice ({"cmd":"delay","frames":n}): taken at once, and auto stops choosing.
@@ -1355,8 +1752,8 @@ void DnNetIdle()
 		if (!GGPO_SUCCEEDED(ggpo_get_network_stats(gSession, gHandle[p], &st))) continue;
 		if (st.network.ping > worstPing) worstPing = st.network.ping;
 		char j[192];
-		sprintf(j, "{\"ev\":\"stats\",\"player\":%d,\"ping\":%d,\"framesAhead\":%d,\"rollbackFrames\":%d,\"held\":%d,\"stalled\":%d,\"frame\":%d}",
-			p + 1, st.network.ping, st.timesync.remote_frames_behind, gRollbackFrames, gHeldFrames, gStalledFrames, gFrame);
+		sprintf(j, "{\"ev\":\"stats\",\"player\":%d,\"ping\":%d,\"framesAhead\":%d,\"rollbackFrames\":%d,\"held\":%d,\"stalled\":%d,\"frame\":%d,\"kbps\":%d}",
+			p + 1, st.network.ping, st.timesync.remote_frames_behind, gRollbackFrames, gHeldFrames, gStalledFrames, gFrame, st.network.kbps_sent);
 		DnEmit(j);
 	}
 	gRollbackFrames = 0;

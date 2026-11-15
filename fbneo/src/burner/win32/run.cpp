@@ -296,7 +296,11 @@ static void RunPacePresent()
 	QueryPerformanceCounter(&now);
 
 	LONGLONG nLead = nPaceNext - now.QuadPart;
-	if (nPaceNext == 0 || nLead < 0) {
+	// dn: a frame that ran late (a rollback re-running frames, a slow PC) is made up by the next ones: the schedule keeps
+	// its place up to 3 frames behind. Starting it again from now lost that time for good, so a match ran at 58.8 fps
+	// instead of 59.6 and the other player held frames to wait (friend test 2026-11-10). Further behind: start again.
+	LONGLONG nCatchUp = bDnNet ? nPeriod * 3 : 0;
+	if (nPaceNext == 0 || nLead < -nCatchUp) {
 		// late (or first frame): present now, the schedule follows
 		nPaceNext = now.QuadPart;
 	} else if (nLead > nPeriod) {
@@ -402,7 +406,7 @@ int RunFrame(int bDraw, int bPause)
 			if ((bDraw & FFWD_GHOST_FRAME) == 0)
 				nFramesRendered++;
 
-			if (!bRunAhead || (BurnDrvGetFlags() & BDF_RUNAHEAD_DISABLED) || bAppDoFast) {
+			if (bDnNet ? !DnRunAheadOn() : (!bRunAhead || (BurnDrvGetFlags() & BDF_RUNAHEAD_DISABLED) || bAppDoFast)) {
 #ifdef FBNEO_DEBUG
 				if (bShonkyProfileMode) do_shonky_profile();
 #endif
@@ -419,7 +423,7 @@ int RunFrame(int bDraw, int bPause)
 			} else {
 				pBurnDraw = (BurnDrvGetFlags() & BDF_RUNAHEAD_DRAWSYNC) ? pVidImage : NULL;
 				BurnDrvFrame();
-				StateRunAheadSave();
+				if (bDnNet) DnRunAheadSave(); else StateRunAheadSave();	// dn: the whole state (dn_netplay.cpp)
 				INT16 *pBurnSoundOut_temp = pBurnSoundOut;
 				pBurnSoundOut = NULL;
 				nCurrentFrame++;
@@ -434,7 +438,7 @@ int RunFrame(int bDraw, int bPause)
 
 				bBurnRunAheadFrame = 0;
 				nCurrentFrame--;
-				StateRunAheadLoad();
+				if (bDnNet) DnRunAheadLoad(); else StateRunAheadLoad();
 				pBurnSoundOut = pBurnSoundOut_temp; // restore pointer, for wav & avi writer
 			}
 		} else {								// frame skipping / ffwd-frame (without avi writing)

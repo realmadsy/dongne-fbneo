@@ -20,6 +20,10 @@ static INT32 reset_delay;
 
 static INT32 neeprom_available = 0;
 
+// dn: netplay, watching and playing alone (which spectators replay) must start the same on every PC, so no .nv file is
+// read or written: the EEPROM starts blank everywhere (dn_netplay.cpp sets this before the game starts)
+INT32 nEEPROMNoFile = 0;
+
 static INT32 overrun_errmsg_ignore = 0;
 
 static INT32 eeprom_command_match(const char *buf, const char *cmd, INT32 len)
@@ -100,7 +104,7 @@ void EEPROMInit(const eeprom_interface *interface)
 
 	INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
 
-	FILE *fz = _tfopen(output, _T("rb"));
+	FILE *fz = nEEPROMNoFile ? NULL : _tfopen(output, _T("rb"));
 	if (fz != NULL) {
 		neeprom_available = 1;
 		fread (eeprom_data, len, 1, fz);
@@ -123,7 +127,7 @@ void EEPROMExit()
 
 	INT32 len = ((1 << intf->address_bits) * (intf->data_bits >> 3)) & (MEMORY_SIZE-1);
 
-	FILE *fz = _tfopen(output, _T("wb"));
+	FILE *fz = nEEPROMNoFile ? NULL : _tfopen(output, _T("wb"));
 	if (fz) {
 		fwrite (eeprom_data, len, 1, fz);
 		fclose (fz);
@@ -383,8 +387,9 @@ void EEPROMScan(INT32 nAction, INT32* pnMin)
 		ba.szName	= "Serial Buffer";
 		BurnAcb(&ba);
 
-		if (nAction & ACB_RUNAHEAD) {
+		if (nAction & (ACB_RUNAHEAD | ACB_NET_OPT)) {
 			// we _must_ scan eeprom data when in RunAhead mode or corruption is a possibility
+			// dn: and for rollback: a game that writes its EEPROM (first start, settings) would otherwise come back changed
 			ScanVar(eeprom_data, MEMORY_SIZE, "eeprom_data");
 		}
 

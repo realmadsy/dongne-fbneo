@@ -751,29 +751,33 @@ INT32 IpsManagerCreate(HWND hParentWND)
 
 bool bDoIpsPatch = false;
 
-static void PatchFile(const char* ips_path, UINT8* base, bool readonly)
+INT32 nDnIpsApplied = 0;	// dn: patch files applied while loading (dn_netplay.cpp reports it, and refuses none)
+
+// dn: the path stays wide (_tfopen): a games folder with Korean letters did not open through the ANSI path
+static void PatchFile(const TCHAR* ips_path, UINT8* base, bool readonly)
 {
 	char buf[6];
 	FILE* f      = NULL;
 	INT32 Offset = 0, Size = 0;
 	UINT8* mem8  = NULL;
 
-	if (NULL == (f = fopen(ips_path, "rb"))) {
-		bprintf(0, _T("IPS - Can't open file %S!  Aborting.\n"), ips_path);
+	if (NULL == (f = _tfopen(ips_path, _T("rb")))) {
+		bprintf(0, _T("IPS - Can't open file %s!  Aborting.\n"), ips_path);
 		return;
 	}
 
 	memset(buf, 0, sizeof(buf));
 	fread(buf, 1, 5, f);
 	if (strcmp(buf, IPS_SIGNATURE)) {
-		bprintf(0, _T("IPS - Bad IPS-Signature in: %S.\n"), ips_path);
+		bprintf(0, _T("IPS - Bad IPS-Signature in: %s.\n"), ips_path);
 		if (f)
 		{
 			fclose(f);
 		}
 		return;
 	} else {
-		bprintf(0, _T("IPS - Patching with: %S. (%S)\n"), ips_path, (readonly) ? "Read-Only" : "Write");
+		bprintf(0, _T("IPS - Patching with: %s. (%S)\n"), ips_path, (readonly) ? "Read-Only" : "Write");
+		if (!readonly) nDnIpsApplied++;
 		UINT8 ch   = 0;
 		INT32 bRLE = 0;
 		while (!feof(f)) {
@@ -1084,7 +1088,7 @@ static void DoPatchGame(const TCHAR* patch_name, const TCHAR* game_name, const U
 						has_ext ? _T("") : IPS_EXT);
 				}
 
-				PatchFile(_TtoA(ips_path), base, readonly);
+				PatchFile(ips_path, base, readonly);
 			}
 		}
 		fclose(fp);
@@ -1632,6 +1636,15 @@ void IpsApplyPatches(UINT8* base, char* rom_name, UINT32 crc, bool readonly)
 		}
 		DoPatchGame(pszDatName, _AtoT(rom_name), crc, base, readonly);
 	}
+}
+
+// dn: one patch for this start, from anywhere: the .dat's folder stands in for support/ips/<game>/, where its .ips are
+void DnIpsUse(const TCHAR* pszDat)
+{
+	for (INT32 i = 0; i < MAX_ACTIVE_PATCHES; i++) szIpsActivePatches[i][0] = _T('\0');
+	_tcsncpy(szIpsActivePatches[0], pszDat, MAX_PATH - 1);
+	_tcscpy(szDriverName, BurnDrvGetText(DRV_NAME));	// the game must be the active driver already
+	bDoIpsPatch = true;
 }
 
 void IpsPatchInit()
