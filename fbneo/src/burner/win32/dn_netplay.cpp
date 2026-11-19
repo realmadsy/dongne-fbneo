@@ -236,13 +236,17 @@ uint32_t DnPackLocalInput(bool focus)
 
 static void DnEmitKeys();
 
+// The device the others see: the one the lever (the four directions, roles 0-3) is on, as a fighting game player is
+// told by what moves the character (owner, 2026-11-20); buttons and hotkeys on the other device do not make it "mixed".
+// No direction set at all: every role, as before.
 static void DnUpdateCtrlBits()
 {
 	gCtrlBits = 0;
-	for (int r = 0; r < DN_ROLES; r++) {
+	for (int r = 0; r < 4; r++)
 		for (size_t c = 0; c < gRoleCodes[r].size(); c++) gCtrlBits |= 1u << (gRoleCodes[r][c] < 0x4000 ? DN_BIT_KEYBOARD : DN_BIT_JOYSTICK);
-	}
-	for (size_t i = 0; i + 2 < gHotkeys.size(); i += 3) gCtrlBits |= 1u << (gHotkeys[i] < 0x4000 ? DN_BIT_KEYBOARD : DN_BIT_JOYSTICK);
+	if (gCtrlBits) return;
+	for (int r = 4; r < DN_ROLES; r++)
+		for (size_t c = 0; c < gRoleCodes[r].size(); c++) gCtrlBits |= 1u << (gRoleCodes[r][c] < 0x4000 ? DN_BIT_KEYBOARD : DN_BIT_JOYSTICK);
 }
 
 void DnSetKeymap(const std::string& line)
@@ -789,6 +793,11 @@ static int DnSyncTest(const DnArgs& a)
 			DnEmitSeats();
 			DnStepFrame(false);
 			DnBoutCheck();	// tests: random inputs finish bouts too
+			if (!a.ramTrace.empty() && nCurrentFrame % 60 == 0) {	// tests: the 68000's work RAM ($ff0000-$ffffff), the frame first
+				static FILE* rt = _wfopen(a.ramTrace.c_str(), L"wb");
+				static UINT8 ram[0x10000];
+				if (rt) { for (int i = 0; i < 0x10000; i++) ram[i] = (UINT8)ReadValueAtHardwareAddress(0xFF0000 + i, 1, 0); UINT32 fr = nCurrentFrame; fwrite(&fr, 4, 1, rt); fwrite(ram, 1, sizeof(ram), rt); fflush(rt); }
+			}
 			ggpo_advance_frame(gSession);
 			if (gBoutEndAt >= 0 && (int)nCurrentFrame >= gBoutEndAt) { DnEmit("{\"ev\":\"ended\",\"reason\":\"bout\"}"); f++; break; }
 		}
@@ -870,6 +879,7 @@ static int DnLoadGame(const DnArgs& a)
 		if (!nDnIpsApplied) { DnEmitError("rom_missing", "the patch did not apply"); return DN_EXIT_ROM; }
 	}
 
+	if (!a.gfxDump.empty()) { FILE* g = _wfopen(a.gfxDump.c_str(), L"wb"); if (g) { fwrite(CpsGfx, 1, nCpsGfxLen, g); fclose(g); } }	// tests: tiles as loaded
 	DnStageEdits();
 	InpDIPSWResetDIPs();	// driver default DIPs on every peer, whatever the local config says
 	DnApplyConstants();
