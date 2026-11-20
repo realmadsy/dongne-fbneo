@@ -1359,7 +1359,12 @@ enum { PR_CAMERA_X = 0xFF8BC4, PR_CAMERA_Y = 0xFF8BC8, PR_Y = 0x0A, PR_FLIP = 0x
 // (PR_BOXTAB) gives where each table starts. Tables 0-2 are what can be hit (head, body, legs), 4 is the attack (12 bytes an entry),
 // 5 is the body that pushes. Table 3 is left out: two entries, and nothing seen using it. Each box: centre x, y from the fighter's
 // point (x mirrored by the facing), half width, half height. A fireball is an object of the same shape.
-enum { BOX_ATTACK = 1, BOX_HURT = 2, BOX_BALL_ATTACK = 4, BOX_BALL_HURT = 8, BOX_PUSH = 16, BOX_PIVOT = 32, PR_GROUND = 233 };
+enum { BOX_ATTACK = 1, BOX_HURT = 2, BOX_BALL_ATTACK = 4, BOX_BALL_HURT = 8, BOX_PUSH = 16, BOX_PIVOT = 32, BOX_THROW = 64, PR_GROUND = 233 };
+// The throw's reach: the game writes it at +0x64 (x, y from the fighter's point, half width, half height; words) only when a throw is
+// tried, and never clears it. So it is taken and cleared here (practice is played alone, nobody to fall out of step with) and kept on
+// the picture for PR_THROW_SHOW pictures, else it would flash for one frame.
+enum { PR_THROW = 0x64, PR_THROW_SHOW = 30 };
+static int gPrThrow[4], gPrThrowLeft = 0;
 static void DnPracticeBoxesOf(UINT8* img, int w, int h, int bpp, int pitch, UINT32 base, bool ball)
 {
 	const int camx = PrWord(PR_CAMERA_X), camy = PrWord(PR_CAMERA_Y);
@@ -1388,6 +1393,26 @@ void DnPracticeOverlay(UINT8* img, int w, int h, int bpp, int pitch)
 		const UINT32 base = gPrBoxSide == 2 ? PR_P2 : PR_P1, ball = (UINT32)PrWord(base + PR_BALL);
 		DnPracticeBoxesOf(img, w, h, bpp, pitch, base, false);
 		if (ball) DnPracticeBoxesOf(img, w, h, bpp, pitch, PR_RAM + ball, true);
+		if (gPrBoxes & BOX_THROW) {
+			for (int p = 0; p < 2; p++) {		// both sides cleared, so a side chosen later shows no old throw
+				const UINT32 b = p ? PR_P2 : PR_P1;
+				int t[4], any = 0;
+				for (int i = 0; i < 4; i++) any |= t[i] = PrWord(b + PR_THROW + i * 2);
+				if (!any) continue;
+				for (int i = 0; i < 4; i++) WriteValueAtHardwareAddress(b + PR_THROW + i * 2, 0, 2, 0);
+				if (b == base) { memcpy(gPrThrow, t, sizeof t); gPrThrowLeft = PR_THROW_SHOW; }
+			}
+			if (gPrThrowLeft > 0) {
+				gPrThrowLeft--;
+				const int camx = PrWord(PR_CAMERA_X), camy = PrWord(PR_CAMERA_Y);
+				const int px = PrWord(base + PR_X) - camx, py = PrWord(base + PR_Y) - camy, flip = PrByte(base + PR_FLIP);
+				const int bx = (INT16)gPrThrow[0], by = (INT16)gPrThrow[1], rw = gPrThrow[2], rh = gPrThrow[3];
+				const int cx = px + (flip ? -bx : bx), cy = PR_GROUND - (py + by);
+				const UINT32 c = BurnHighCol(255, 230, 40, 0);
+				PrRect(img, w, h, bpp, pitch, cx - rw, cy - rh, cx + rw, cy + rh, c);
+				PrRect(img, w, h, bpp, pitch, cx - rw + 1, cy - rh + 1, cx + rw - 1, cy + rh - 1, c);
+			}
+		}
 	}
 	if (!gPrShowHp && !gPrShowStun) return;
 	const UINT32 ink = BurnHighCol(0xFF, 0xFF, 0xFF, 0), shade = BurnHighCol(0, 0, 0, 0), well = BurnHighCol(0x22, 0x22, 0x22, 0);
