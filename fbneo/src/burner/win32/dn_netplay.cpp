@@ -793,6 +793,10 @@ static int DnSyncTest(const DnArgs& a)
 			DnEmitSeats();
 			DnStepFrame(false);
 			DnBoutCheck();	// tests: random inputs finish bouts too
+			if (!a.hpTrace.empty()) {	// tests: frame, then each SF2 fighter's health (word at fighter + 0x2a)
+				static FILE* ht = _wfopen(a.hpTrace.c_str(), L"w");
+				if (ht) fprintf(ht, "%u %u %u\n", (unsigned)nCurrentFrame, ReadValueAtHardwareAddress(0xFF83E8, 2, 0), ReadValueAtHardwareAddress(0xFF86E8, 2, 0));
+			}
 			if (!a.ramTrace.empty() && nCurrentFrame % 60 == 0) {	// tests: the 68000's work RAM ($ff0000-$ffffff), the frame first
 				static FILE* rt = _wfopen(a.ramTrace.c_str(), L"wb");
 				static UINT8 ram[0x10000];
