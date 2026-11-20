@@ -13,7 +13,7 @@ struct DnArgs {
 	int testStart = 0;		// --test-start <frame>: acts as if the start key went down at that frame, and reports the credits (tests)
 	int testCrash = 0;		// --test-crash 1: crashes on the first input read (tests)
 	int testSlow = 0;		// --test-slow <ms>: every 30th frame takes that much longer, like a slow PC re-running frames (tools/netsim.js --slow)
-	std::wstring ramTrace, gfxDump;	// tests: --ram-trace (dn:synctest) work RAM every 60th frame; --gfx-dump the tiles as loaded, before stage edits
+	std::wstring ramTrace, gfxDump;	// tests: --ram-trace (dn:synctest) work RAM every 60th frame; --gfx-dump the tiles as drawn (after the stage edits)
 	int boutEnd = 0;		// --bout-end n: the team relay - the game ends n frames after a bout is told (the win pose shows)
 	bool feed = false;		// --feed 1: alone (playing while the room waits), still send out the inputs for spectators
 	bool watch = false;		// --watch 1: a spectator: no session, the players' confirmed inputs come from the lobby ({"cmd":"feed"})

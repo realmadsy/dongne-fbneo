@@ -840,6 +840,32 @@ static void DnStageEdits()
 			if (at + 64 <= nCpsGfxLen) { memset(CpsGfx + at, 0, 64); gStageTiles++; }
 		}
 	}
+	// E. Honda's stage: the rays around the sun on the bath-house wall are painted in the wall's own colours (pens 1, 5, 6,
+	// 7 -> 3, 2, 3, 4), the sun itself (an ellipse) is kept: a plain circle, as on Japan's flag (owner, 2026-11-20). 32x32
+	// tiles (512 bytes, rows of 16 bytes, 8 pixels to a 32-bit word, highest nibble first); the sun's ellipse is in the
+	// wall's layout, where tile 0x2450 + i sits at ((i % 8) * 32, (i / 8) * 32).
+	static const UINT32 kWall[] = { 0x244b, 0x244f, 0x2451, 0x2453, 0x2454, 0x2455, 0x2456, 0x2457, 0x2459, 0x245a,
+		0x245b, 0x245c, 0x245d, 0x245e, 0x245f, 0x2460, 0x2461, 0x2463, 0x2464, 0x2468 };
+	static const UINT8 kPen[16] = { 0, 3, 2, 3, 4, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15 };
+	const double cx = 172.0, cy = 16.0, rx = 20.5, ry = 15.5;
+	for (size_t i = 0; i < sizeof(kWall) / sizeof(kWall[0]); i++) {
+		const UINT32 at = kWall[i] << 9;
+		if (at + 512 > nCpsGfxLen) continue;
+		const int k = (int)kWall[i] - 0x2450, ox = ((k % 8 + 8) % 8) * 32, oy = (k >= 0 ? k / 8 : -1) * 32;
+		for (int y = 0; y < 32; y++) for (int w = 0; w < 4; w++) {
+			UINT32* word = (UINT32*)(CpsGfx + at + y * 16 + w * 4);
+			UINT32 v = *word, out = 0;
+			for (int px = 0; px < 8; px++) {
+				const int sh = 28 - 4 * px, x = ox + w * 8 + px, yy = oy + y;
+				UINT32 pen = (v >> sh) & 15;
+				const double ex = (x - cx) / rx, ey = (yy - cy) / ry;
+				if (ex * ex + ey * ey > 1.0) pen = kPen[pen];
+				out |= pen << sh;
+			}
+			*word = out;
+		}
+		gStageTiles++;
+	}
 }
 
 // Rom path + driver init + netplay-safe input setup. Returns 0 or a DN_EXIT_* code (error already emitted).
@@ -879,8 +905,8 @@ static int DnLoadGame(const DnArgs& a)
 		if (!nDnIpsApplied) { DnEmitError("rom_missing", "the patch did not apply"); return DN_EXIT_ROM; }
 	}
 
-	if (!a.gfxDump.empty()) { FILE* g = _wfopen(a.gfxDump.c_str(), L"wb"); if (g) { fwrite(CpsGfx, 1, nCpsGfxLen, g); fclose(g); } }	// tests: tiles as loaded
 	DnStageEdits();
+	if (!a.gfxDump.empty()) { FILE* g = _wfopen(a.gfxDump.c_str(), L"wb"); if (g) { fwrite(CpsGfx, 1, nCpsGfxLen, g); fclose(g); } }	// tests: the tiles as drawn
 	InpDIPSWResetDIPs();	// driver default DIPs on every peer, whatever the local config says
 	DnApplyConstants();
 	gPlayers = a.players;
@@ -1679,14 +1705,27 @@ int DnNetGetInput()
 // second, so a rollback can no longer take it back; spectators tell it too, from the same frames.
 static void DnBoutCheck()
 {
-	if (gArgs.game != "sf2ce" || gArgs.practice) return;
-	static int last = 0, held = 0;
+	bool team = false;	// a game of team battles: a bout is a whole battle
+	if ((gArgs.game != "sf2ce" && !team) || gArgs.practice) return;
+	static int last = 0, held = 0, fightWinner = 0, fights = 0;
 	static bool told = false;
-	const int won = ((int)ReadValueAtHardwareAddress(0xFF864E, 1, 0) >= 2 ? 1 : 0) | ((int)ReadValueAtHardwareAddress(0xFF894E, 1, 0) >= 2 ? 2 : 0);
+	const int need = team ? 1 : 2;
+	if (team) {
+		const int n = (int)ReadValueAtHardwareAddress(0xFF0F0B, 1, 0);
+		if (n == 0 && fights > 0 && fightWinner) {
+			char j[80];
+			sprintf(j, "{\"ev\":\"bout\",\"winner\":%d,\"frame\":%d}", fightWinner, (int)nCurrentFrame);
+			DnEmit(j);
+			fightWinner = 0;
+		}
+		fights = n;
+	}
+	const int won = ((int)ReadValueAtHardwareAddress(0xFF864E, 1, 0) >= need ? 1 : 0) | ((int)ReadValueAtHardwareAddress(0xFF894E, 1, 0) >= need ? 2 : 0);
 	if (won != last) { last = won; held = 0; }
 	if (!won) { told = false; return; }
 	if (++held == 60 && !told) {
 		told = true;
+		if (team) { if (won != 3) fightWinner = won; return; }	// a fight of the battle: told with the battle's end
 		char j[80];
 		sprintf(j, "{\"ev\":\"bout\",\"winner\":%d,\"frame\":%d}", won == 3 ? 0 : won, (int)nCurrentFrame);	// 0: both, a draw
 		DnEmit(j);
