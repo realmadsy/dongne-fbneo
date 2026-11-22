@@ -369,9 +369,10 @@ int ActivateChat()
 	return 0;
 }
 
+extern int nDnNetplay;	// dn_netplay.cpp: a dongne game, set before the driver starts
 INT32 is_netgame_or_recording() // returns: 1 = netgame, 2 = recording/playback
 {
-	return (kNetGame | (movieFlags & (1<<1))); // netgame or recording from power_on
+	return (kNetGame | nDnNetplay | (movieFlags & (1<<1))); // netgame or recording from power_on
 }
 
 static int WINAPI gameCallback(char* game, int player, int numplayers)
@@ -4795,6 +4796,9 @@ int ScrnInit()
 	}
 
 	if (DnParentWnd()) {		// dn: plain child of the lobby window, no frame or menu; ScrnSize() places it
+		// the lobby window (frameless since 0.2.42) must not paint over this one: without WS_CLIPCHILDREN each repaint of
+		// the page flashed through the game picture for a frame (measured 2026-11-21: 5-7 in 600 captures, 0 with it)
+		SetWindowLongPtr(DnParentWnd(), GWL_STYLE, GetWindowLongPtr(DnParentWnd(), GWL_STYLE) | WS_CLIPCHILDREN);
 		hScrnWnd = CreateWindowEx(0, szClass, _T(APP_TITLE), WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
 			0, 0, 0, 0, DnParentWnd(), NULL, hAppInst, NULL);
 		if (hScrnWnd == NULL) {

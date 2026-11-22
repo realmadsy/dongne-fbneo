@@ -82,9 +82,19 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		}
 		else if (k == L"--feed") a.feed = wcscmp(v, L"1") == 0;
 		else if (k == L"--bout-end") ok = ParseInt(v, 1, 3600, a.boutEnd);
+		else if (k == L"--set-first") ok = ParseInt(v, 1, 9, a.setFirst);
+		else if (k == L"--set-won") ok = swscanf(v, L"%d,%d", &a.setWon[0], &a.setWon[1]) == 2 && a.setWon[0] >= 0 && a.setWon[1] >= 0 && a.setWon[0] < 9 && a.setWon[1] < 9;
 		else if (k == L"--watch") a.watch = wcscmp(v, L"1") == 0;
+		else if (k == L"--replay") { a.replay = wcscmp(v, L"1") == 0; if (a.replay) a.watch = true; }
 		else if (k == L"--fast-start") a.fastStart = wcscmp(v, L"1") == 0;
 		else if (k == L"--practice") a.practice = wcscmp(v, L"1") == 0;
+		else if (k == L"--latency-probe") a.latencyProbe = wcscmp(v, L"1") == 0;
+		else if (k == L"--fix-dirs") a.fixDirs = wcscmp(v, L"1") == 0;
+		else if (k == L"--balance") a.balance = wcscmp(v, L"1") == 0;
+		else if (k == L"--vid-select") { ok = ParseUInt(v, 0, 5, u); a.vidSelect = (int)u; }
+		else if (k == L"--dwm-sync") { ok = ParseUInt(v, 0, 1, u); a.dwmSync = (int)u; }
+		else if (k == L"--aud-select") { ok = ParseUInt(v, 0, 2, u); a.audSelect = (int)u; }
+		else if (k == L"--aud-segs") { ok = ParseUInt(v, 2, 16, u); a.audSegs = (int)u; }
 		else if (k == L"--practice-set") a.practiceSet = Narrow(v);
 		else if (k == L"--script") a.script = Narrow(v);
 		else if (k == L"--script-file") {		// tests: a script longer than FBNeo's command line takes

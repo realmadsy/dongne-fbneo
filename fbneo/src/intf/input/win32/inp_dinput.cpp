@@ -43,6 +43,8 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE, LPVOID);
 
 	struct devEnumGuids {
 		GUID guid;
+		GUID product;		// dn: the device's product (VID/PID in Data1) and name, so a binding can follow its device
+		WCHAR name[MAX_PATH];
 	} devGuids[MAX_GAMEPAD];
 
 	struct gamepadData {
@@ -54,6 +56,9 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE, LPVOID);
 		DWORD dwPOVs;
 		DWORD dwButtons;
 		unsigned char readStatus;
+		GUID guid, product;	// dn: which device this is (devEnumGuids)
+		WCHAR name[MAX_PATH];
+		int lostFrames;		// dn: frames in a row it could not be read (unplugged): DInputPadLost
 	} gamepadProperties[MAX_GAMEPAD];
 
 	struct mouseData {
@@ -163,6 +168,8 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE, LPVOID);
 		}
 
 		devGuids[guidCount].guid = instance->guidInstance;
+		devGuids[guidCount].product = instance->guidProduct;
+		lstrcpynW(devGuids[guidCount].name, instance->tszProductName, MAX_PATH);
 		guidCount++;
 
 		return DIENUM_CONTINUE;
@@ -339,11 +346,20 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE, LPVOID);
 			return 1;
 		}
 
+		// dn: tests only (DN_PADS_REVERSE=1): the devices in the other order, as a reboot or another USB port may give them
+		if (GetEnvironmentVariableA("DN_PADS_REVERSE", NULL, 0)) {
+			for (int a = 0, b = guidCount - 1; a < b; a++, b--) { devEnumGuids t = devGuids[a]; devGuids[a] = devGuids[b]; devGuids[b] = t; }
+		}
+
 		// Set Up gamepads
 		for (int i = 0; i < guidCount; i++) {
 			// Create the DirectInput interface
 			if (SUCCEEDED(pDI->CreateDevice(devGuids[i].guid, &gamepadProperties[gamepadCount].lpdid, NULL))) {
 				if (!gamepadInitSingle()) {
+					gamepadProperties[gamepadCount].lostFrames = 0;
+					gamepadProperties[gamepadCount].guid = devGuids[i].guid;
+					gamepadProperties[gamepadCount].product = devGuids[i].product;
+					lstrcpynW(gamepadProperties[gamepadCount].name, devGuids[i].name, MAX_PATH);
 					gamepadCount++;
 				} else {
 					RELEASE(gamepadProperties[gamepadCount].lpdid)
@@ -436,11 +452,13 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE, LPVOID);
 			gamepad->lpdid->Acquire();		// If DIERR_INPUTLOST, reacquire and try again
 		}
 		if (FAILED(ret)) {
+			gamepad->lostFrames++;	// dn: once a frame (readStatus 2 answers the frame's other reads)
 			return 1;
 		}
 
 		// This gamepad had been successfully Read this frame
 		gamepad->readStatus = 1;
+		gamepad->lostFrames = 0;
 
 		return 0;
 	}
@@ -939,6 +957,115 @@ static BOOL CALLBACK mouseEnumCallback(LPCDIDEVICEINSTANCE instance, LPVOID /*p*
 {
 //	return ((InputDI*)p)->mouseEnumDevice(instance);
 	return mouseEnumDevice(instance);
+}
+
+// dn: a pad unplugged in the middle of a game never comes back through DirectInput's own re-acquire (readGamepad), not
+// even in the same USB port (seen with an Xbox pad, 2026-11-22: the old device object stays dead). While a pad is lost, a
+// thread of its own looks once a second for an attached device of the same product that no working slot has (EnumDevices
+// is slow: never on the game's thread); the game opens it afresh and
+// then puts it in the lost pad's slot (DInputPadSwap), so the slot's number, and every binding on it, stays the same.
+#include <thread>
+#include <mutex>
+#include <atomic>
+static std::mutex padSeekLock;
+static GUID padSeekProduct[MAX_GAMEPAD], padSeekFound[MAX_GAMEPAD], padSlotGuid[MAX_GAMEPAD];
+static bool padSeeking[MAX_GAMEPAD], padFound[MAX_GAMEPAD];
+static int padSlots = 0;
+static std::atomic<bool> padSeekThread(false);
+static std::atomic<int> padSeekSeen(-1), padSeekSame(-1), padSwapErr(0);	// last look: game controllers, of the lost product; last swap's failure
+static BOOL CALLBACK padSeekEnum(LPCDIDEVICEINSTANCEW inst, LPVOID)
+{
+	std::lock_guard<std::mutex> g(padSeekLock);
+	padSeekSeen++;
+	// a slot still reading it has it; the lost slot's own instance is fair game: plugged back into the same port it comes back
+	// with the same instance GUID, but the old device object stays dead, so it is opened afresh like one found elsewhere
+	for (int i = 0; i < padSlots; i++) if (!padSeeking[i] && IsEqualGUID(inst->guidInstance, padSlotGuid[i])) return DIENUM_CONTINUE;
+	for (int i = 0; i < padSlots; i++) {
+		if (padSeeking[i] && IsEqualGUID(inst->guidProduct, padSeekProduct[i])) padSeekSame++;
+		if (padSeeking[i] && !padFound[i] && IsEqualGUID(inst->guidProduct, padSeekProduct[i])) {
+			padSeekFound[i] = inst->guidInstance;
+			padFound[i] = true;
+			break;
+		}
+	}
+	return DIENUM_CONTINUE;
+}
+static void padSeekRun()
+{
+	for (;;) {
+		Sleep(1000);
+		bool any = false;
+		{ std::lock_guard<std::mutex> g(padSeekLock); for (int i = 0; i < padSlots; i++) any = any || (padSeeking[i] && !padFound[i]); }
+		if (!any) break;
+		// a fresh DirectInput each look (only while a pad is lost): an old one may keep the device list it first saw
+		IDirectInput8W* di = NULL;	// the same dinput8.dll the plugin loaded (dinput_core.cpp)
+		if (!_DirectInput8Create || FAILED(_DirectInput8Create(GetModuleHandle(NULL), DIRECTINPUT_VERSION, IID_IDirectInput8W, (void**)&di, NULL)) || !di) break;
+		padSeekSeen = 0; padSeekSame = 0;
+		di->EnumDevices(DI8DEVCLASS_GAMECTRL, padSeekEnum, NULL, DIEDFL_ATTACHEDONLY);
+		di->Release();
+	}
+	padSeekThread = false;
+}
+
+// the last look for a lost pad, for the game's log: game controllers attached, of the lost pad's product, last swap failure
+void DInputPadSeekInfo(int* seen, int* same, int* err)
+{
+	*seen = padSeekSeen; *same = padSeekSame; *err = padSwapErr;
+}
+// frames in a row pad i could not be read (0: fine; a pad nobody reads is never counted)
+int DInputPadLost(int i)
+{
+	return i >= 0 && i < gamepadCount ? gamepadProperties[i].lostFrames : 0;
+}
+// start (or stop) looking for pad i's device elsewhere
+void DInputPadSeek(int i, bool on)
+{
+	if (i < 0 || i >= gamepadCount) return;
+	{
+		std::lock_guard<std::mutex> g(padSeekLock);
+		padSlots = gamepadCount;
+		for (int k = 0; k < gamepadCount; k++) padSlotGuid[k] = gamepadProperties[k].guid;
+		padSeeking[i] = on;
+		padFound[i] = false;
+		padSeekProduct[i] = gamepadProperties[i].product;
+	}
+	bool idle = false;
+	if (on && padSeekThread.compare_exchange_strong(idle, true)) std::thread(padSeekRun).detach();
+}
+// a lost pad's device found elsewhere goes into its slot (on the game's thread, between frames): that slot's number or -1
+int DInputPadSwap()
+{
+	int slot = -1;
+	GUID found;
+	{
+		std::lock_guard<std::mutex> g(padSeekLock);
+		for (int i = 0; i < padSlots && slot < 0; i++) if (padSeeking[i] && padFound[i]) { slot = i; found = padSeekFound[i]; padSeeking[i] = padFound[i] = false; }
+	}
+	if (slot < 0 || slot >= gamepadCount) return -1;
+	IDirectInputDevice8W* old = gamepadProperties[slot].lpdid;
+	gamepadProperties[slot].lpdid = NULL;
+	const HRESULT hr = pDI->CreateDevice(found, &gamepadProperties[slot].lpdid, NULL);
+	if (FAILED(hr)) { padSwapErr = (int)hr; gamepadProperties[slot].lpdid = old; return -1; }
+	const int count = gamepadCount;
+	gamepadCount = slot;	// gamepadInitSingle and its axes callback set up gamepadProperties[gamepadCount]
+	const int bad = gamepadInitSingle();
+	gamepadCount = count;
+	if (bad) { padSwapErr = 1; RELEASE(gamepadProperties[slot].lpdid) gamepadProperties[slot].lpdid = old; return -1; }
+	if (old) { old->Unacquire(); old->Release(); }
+	gamepadProperties[slot].guid = found;
+	gamepadProperties[slot].lostFrames = 0;
+	gamepadProperties[slot].readStatus = 0;
+	return slot;
+}
+
+// dn: the pads as numbered now (joystick codes 0x4000 | i << 8 | control): which device each one is. 0 when i is a pad.
+int DInputPadInfo(int i, GUID* guid, GUID* product, const WCHAR** name)
+{
+	if (i < 0 || i >= gamepadCount) return 1;
+	if (guid) *guid = gamepadProperties[i].guid;
+	if (product) *product = gamepadProperties[i].product;
+	if (name) *name = gamepadProperties[i].name;
+	return 0;
 }
 
 struct InputInOut InputInOutDInput = { init, exit, setCooperativeLevel, newFrame, getState, readGamepadAxis, readMouseAxis, find, getControlName, NULL, _T("DirectInput8 input") };

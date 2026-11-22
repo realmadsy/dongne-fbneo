@@ -133,6 +133,7 @@ static UINT8 (*cpu_read_byte)(UINT32);
 #endif
 
 static INT32 host_endian = 0;
+static INT32 cupsoc_mode = 0; // MAME m_cupsoc_mode (SEIBUCOP_V1): every cupsoc-only behaviour below is gated on it
 static INT32 byte_endian_val = 0;
 static INT32 word_endian_val = 0;
 
@@ -227,10 +228,12 @@ static UINT8 cop_read_byte(UINT32 offset)
 	return cpu_read_byte(offset ^ byte_endian_val);
 }
 
-static void execute_0205(INT32 offset, UINT16 )
+static void execute_0205(INT32 offset, UINT16 data)
 {
-	INT32 ppos =        cpu_read_long(cop_regs[0] + 0x04 + offset * 4);
-	INT32 npos = ppos + cpu_read_long(cop_regs[0] + 0x10 + offset * 4);
+	INT32 ppos = cpu_read_long(cop_regs[0] + 0x04 + offset * 4);
+	INT32 vel  = cpu_read_long(cop_regs[0] + 0x10 + offset * 4);
+	// bit 0 of the trigger is the sign of the addend: 0205 adds, 0204 (only cupsoc emits it) undoes the step
+	INT32 npos = (!cupsoc_mode || (data & 1)) ? (ppos + vel) : (ppos - vel);
 	INT32 delta = (npos >> 16) - (ppos >> 16);
 
 	cpu_write_long(cop_regs[0] + 4 + offset * 4, npos);
@@ -263,12 +266,18 @@ static void LEGACY_execute_130e_cupsoc(INT32 , UINT16 data)
 			cop_angle += 0x80;
 
 		cop_angle &= 0xff;
+
+		// the COP works in pixels: the flag looks at the integer part of the delta
+		if (cupsoc_mode && !(dx >> 16))
+			cop_status |= 0x8000;
 	}
 
 	LEGACY_r0 = dy;
 	LEGACY_r1 = dx;
 
-	if (data & 0x80)
+	// cupsoc: the trigger length ((data >> 7) & 7) + 1 decides the store: 118e loads, 130e computes, 138e stores
+	const bool writes_angle = cupsoc_mode ? ((((data >> 7) & 7) + 1) >= 8) : ((data & 0x80) != 0);
+	if (writes_angle)
 		cop_write_byte(cop_regs[0] + (0x34), cop_angle);
 }
 
@@ -347,6 +356,55 @@ static void execute_3b30(INT32 , UINT16 data)
 
 	if (data & 0x0080)
 		cop_write_word(cop_regs[0] + (data & 0x200 ? 0x3a : 0x38), cop_dist);
+}
+
+// cupsoc: same as execute_3b30 but on the dx/dy latched by the last angle command (e18e right before)
+static void execute_3b30_latched(INT32 , UINT16 data)
+{
+	INT32 dy = LEGACY_r0 >> 16;
+	INT32 dx = LEGACY_r1 >> 16;
+
+	cop_dist = (UINT16)sqrt((double)(dx*dx + dy*dy));
+
+	if (data & 0x0080)
+		cop_write_word(cop_regs[0] + (data & 0x200 ? 0x3a : 0x38), cop_dist);
+}
+
+// 16.16 multiply by the constant in the COP ROM address registers ($100446/$100448), loaded by cupsoc before 5105/5905/f105
+static UINT32 cop_fixmul1616(UINT32 a)
+{
+	const INT32 b = (INT32)(((UINT32)cop_rom_addr_hi << 16) | cop_rom_addr_lo);
+	const INT64 p = (INT64)(INT32)a * (INT64)b;
+	return (UINT32)(p >> 16);
+}
+
+static void execute_5105(INT32 offset, UINT16 )
+{
+	if (!cupsoc_mode) return; // was never called before cupsoc
+	cpu_write_long(cop_regs[0] + 0x04 + offset * 4, cop_fixmul1616(cpu_read_long(cop_regs[0] + 0x00 + offset * 4)));
+}
+
+static void execute_5905(INT32 offset, UINT16 )
+{
+	if (!cupsoc_mode) return;
+	cpu_write_long(cop_regs[1] + 0x04 + offset * 4, cop_fixmul1616(cpu_read_long(cop_regs[2] + 0x10 + offset * 4)));
+}
+
+static void execute_f105(INT32 offset, UINT16 )
+{
+	if (!cupsoc_mode) return;
+	const UINT32 adr = cop_regs[0] + 0x10 + offset * 4; // velocity scaled in place (by 0.75) between 8100 and 8900
+	cpu_write_long(adr, cop_fixmul1616(cpu_read_long(adr)));
+}
+
+static void LEGACY_execute_d104(INT32 offset, UINT16 )
+{
+	if (!cupsoc_mode) return;
+	// player's positional target: (ball - origin) * K >> 16, the 68000 adds the zone minimum
+	const INT32 org = (INT32)cpu_read_long(cop_regs[3] + offset * 4);
+	const INT32 src = (INT32)cpu_read_long(cop_regs[2] + 0x04 + offset * 4);
+	const INT32 k   = (INT32)(((UINT32)cop_rom_addr_hi << 16) | cop_rom_addr_lo);
+	cpu_write_long(cop_regs[1] + 0x04 + offset * 4, (UINT32)(INT32)(((INT64)(src - org) * (INT64)k) >> 16));
 }
 
 static void execute_42c2(INT32 , UINT16 )
@@ -464,7 +522,7 @@ static void LEGACY_execute_6200(INT32 , UINT16 ) // this is for cupsoc, differen
 
 	cop_write_word(cop_regs[primary_reg], flags);
 
-	if (!host_endian)
+	if (!host_endian || cupsoc_mode) // cupsoc: a word write would clear the body facing in the next byte
 		cop_write_byte(cop_regs[primary_reg] + primary_offset, angle);
 	else // angle is a byte, but grainbow (cave mid-boss) is only happy with write-word, could be more endian weirdness, or it always writes a word?
 		cop_write_word(cop_regs[primary_reg] + primary_offset, angle);
@@ -685,6 +743,15 @@ static void LEGACY_execute_e30e(INT32 , UINT16 data)
 		cop_angle &= 0xff;
 	}
 
+	if (cupsoc_mode) {
+		// e18e loads, e30e computes, e38e stores; the dx/dy feed the 3bb0 that follows
+		LEGACY_r0 = dy;
+		LEGACY_r1 = dx;
+		if (((data >> 7) & 7) + 1 >= 8)
+			cop_write_byte(cop_regs[0] + 0x34, cop_angle);
+		return;
+	}
+
 	// TODO: byte or word?
 	if (data & 0x0080)
 		cop_write_byte(cop_regs[0] + 0x34, cop_angle);
@@ -792,6 +859,13 @@ static void LEGACY_cop_cmd_write(INT32 offset, UINT16 data)
 		return;
 	}
 
+	// 330e / 338e: same atan2, the microcode cupsoc uploads uses $38 instead of $34 (other games upload it too, never call it)
+	if (cupsoc_mode && check_command_matches(command, 0x984, 0xaa4, 0xd82, 0xaa2, 0x39c, 0xb9c, 0xb9c, 0xa9a, 5, 0xbf7f))
+	{
+		LEGACY_execute_130e_cupsoc(offset, data);
+		return;
+	}
+
 	if (check_command_matches(command, 0x984, 0xaa4, 0xd82, 0xaa2, 0x39b, 0xb9a, 0xb9a, 0xb9a, 5, 0xbf7f))
 	{
 		execute_130e(offset, data, true);
@@ -800,7 +874,10 @@ static void LEGACY_cop_cmd_write(INT32 offset, UINT16 data)
 
 	if (check_command_matches(command, 0xf9c, 0xb9c, 0xb9c, 0xb9c, 0xb9c, 0xb9c, 0xb9c, 0x99c, 4, 0x007f))
 	{
-		execute_3b30(offset, data);
+		if (cupsoc_mode)
+			execute_3b30_latched(offset, data);
+		else
+			execute_3b30(offset, data);
 		return;
 	}
 
@@ -872,23 +949,25 @@ static void LEGACY_cop_cmd_write(INT32 offset, UINT16 data)
 
 	if (check_command_matches(command, 0xac2, 0x9e0, 0x0a2, 0x000, 0x000, 0x000, 0x000, 0x000, 5, 0xfffb))
 	{
-	//	LEGACY_execute_d104(offset, data);
+		LEGACY_execute_d104(offset, data);
 		return;
 	}
 
 	if (check_command_matches(command, 0xa80, 0x984, 0x082, 0x000, 0x000, 0x000, 0x000, 0x000, 5, 0xfefb))
 	{
+		execute_5105(offset, data);
 		return;
 	}
 
 	if (check_command_matches(command, 0x9c8, 0xa84, 0x0a2, 0x000, 0x000, 0x000, 0x000, 0x000, 5, 0xfffb))
 	{
+		execute_5905(offset, data);
 		return;
 	}
 
 	if (check_command_matches(command, 0xa88, 0x994, 0x088, 0x000, 0x000, 0x000, 0x000, 0x000, 5, 0xfefb))
 	{
-	//	execute_f105(offset,data);
+		execute_f105(offset, data);
 		return;
 	}
 }
@@ -1212,9 +1291,34 @@ static void cop_dma_trigger()
 	}
 }
 
+static void dma_zsorting_cupsoc(UINT16 data)
+{
+	// cupsoc passes the entry count minus one; the key is the signed word at the long-aligned address
+	// (an object on the ball has key $ffff, which sorted unsigned goes to the far end). Stable insertion sort, as MAME's stable_sort.
+	const INT32 n = data + 1;
+	static UINT16 val[0x10000 / 2];
+	static INT32 key[0x10000 / 2];
+	if (n > 0x8000) return;
+	for (INT32 i = 0; i < n; i++) {
+		val[i] = cpu_read_word(cop_sort_lookup + 2*i);
+		key[i] = (INT16)cpu_read_word((cop_sort_ram_addr + val[i]) & ~3);
+	}
+	if (cop_sort_param == 1 || cop_sort_param == 2) {
+		for (INT32 i = 1; i < n; i++) {
+			UINT16 v = val[i]; INT32 k = key[i]; INT32 j = i - 1;
+			while (j >= 0 && (cop_sort_param == 2 ? (key[j] < k) : (key[j] > k))) { val[j+1] = val[j]; key[j+1] = key[j]; j--; }
+			val[j+1] = v; key[j+1] = k;
+		}
+	}
+	for (INT32 i = 0; i < n; i++)
+		cpu_write_word(cop_sort_lookup + 2*i, val[i]);
+}
+
 static void dma_zsorting(UINT16 sort_size)
 {
 	UINT8 xchg_flag;
+
+	if (cupsoc_mode) { dma_zsorting_cupsoc(sort_size); return; }
 
 	for(INT32 i = 2;i < sort_size;i+=2)
 	{
@@ -1627,6 +1731,13 @@ void seibu_cop_config(INT32 is_68k, void (*vidram_write)(INT32,UINT16,UINT16), v
 
 	cop_paletteram_cb = pal_write;
 	cop_videoram_cb = vidram_write;
+
+	cupsoc_mode = 0;
+}
+
+void seibu_cop_set_cupsoc(INT32 on)
+{
+	cupsoc_mode = on;
 }
 
 INT32 seibu_cop_scan(INT32 nAction,INT32 *)

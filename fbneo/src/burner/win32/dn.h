@@ -15,9 +15,16 @@ struct DnArgs {
 	int testSlow = 0;		// --test-slow <ms>: every 30th frame takes that much longer, like a slow PC re-running frames (tools/netsim.js --slow)
 	std::wstring ramTrace, gfxDump, hpTrace;	// hpTrace (dn:synctest): both SF2 fighters' health every frame, one text line each	// tests: --ram-trace (dn:synctest) work RAM every 60th frame; --gfx-dump the tiles as drawn (after the stage edits)
 	int boutEnd = 0;		// --bout-end n: the team relay - the game ends n frames after a bout is told (the win pose shows)
+	int setFirst = 0;		// --set-first n (with --bout-end): a push-out set, first to n bouts: the game goes on between bouts
+	int setWon[2] = { 0, 0 };	// --set-won a,b: the bouts each game side (1P, 2P) has won in the set so far
 	bool feed = false;		// --feed 1: alone (playing while the room waits), still send out the inputs for spectators
+	bool replay = false;	// --replay 1: a recorded match (implies --watch): all of the feed is there; paused, slower or faster, stepped and moved by {"cmd":"replay"}
 	bool watch = false;		// --watch 1: a spectator: no session, the players' confirmed inputs come from the lobby ({"cmd":"feed"})
 	bool fastStart = false;	// --fast-start 1: skip the boot, open on character select (DnFastStart)
+	int vidSelect = -1, dwmSync = -1, audSelect = -1, audSegs = -1;	// --aud-select / --aud-segs (tests): 0 DirectSound, 2 WASAPI; frames of buffer	// --vid-select / --dwm-sync (tests): the blitter (0 DDraw, 2 DDrawFX, 3 DX9, 4 DX9 Alt, 5 D3D11) and FBNeo's "sync to DWM", over the settings file
+	bool balance = true;	// hold a frame when 2+ frames ahead of the peer, not only from 3 (GGPO): rollbacks split evenly (owner 2026-11-22: on); --balance 0 turns it off
+	bool fixDirs = false;	// --fix-dirs 1: a direction skipped between two diagonals is put in for a frame (DnFixDirs)
+	bool latencyProbe = false;	// --latency-probe 1 (tests): the picture's top-left corner white in a frame whose input had Scroll Lock down (tools/latency)
 	bool practice = false;	// --practice 1: alone, no session; SF2 Dash's other fighter follows the panel, KOF '98 opens its own practice mode
 	std::string practiceSet;	// --practice-set: the settings to start with, as in the "practice" command
 	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
@@ -54,6 +61,8 @@ INT32 InputReadSwitch(const INT32 nCode);
 // dn_netplay.cpp
 bool DnTryMain(const wchar_t* cmdline, int& exitCode);	// true: fully handled (synctest, bad args); false: continue normal init
 int DnRun(const DnArgs& a);
+void DnSetSocd(const std::string& line);	// {"cmd":"socd","on":1}: left+right and up+down held together count as neither
+void DnSetPadDevs(const std::string& line);	// {"cmd":"paddevs","d":[pad, guid x8, product x2, ...]}: before the keymap; saved pad numbers follow their devices
 void DnSetKeymap(const std::string& line);	// {"cmd":"keymap","up":[200,16386],...,"fire1":[44]}: codes per role (keyboard DIK / FBNeo joystick)
 bool DnRunAheadOn();					// run.cpp: lobby mode with --runahead 1 (and a game that allows it)
 void DnRunAheadSave();					// run.cpp: the whole state, as rollback saves it
@@ -61,6 +70,7 @@ void DnRunAheadLoad();
 void DnSetDelay(const std::string& line);	// {"cmd":"delay","frames":2}: the lobby sets the frame delay
 void DnSnapAsk();	// {"cmd":"snap"}: a player's newest final state, for a late spectator
 void DnWatchState(const std::string& line);	// {"cmd":"state","d":base64}: a spectator starts from it
+void DnReplayCmd(const std::string& line);	// {"cmd":"replay","op":"pause"|"play"|"speed"|"step"|"seek","x":n}: a replay's controls
 void DnWatchFeed(const std::string& line);	// {"cmd":"feed","from":f,"d":"n:w.w,...","h":"f:h,..."}: a spectator's next inputs (see dn_netplay.cpp)
 void DnSetVolume(const std::string& line);	// {"cmd":"volume","v":0-100}: the game's sound, from the lobby's slider
 void DnSetSeat(const std::string& line);	// {"cmd":"seat","to":3}: move to that player number if nobody holds it

@@ -271,6 +271,8 @@ bool DnIpcPoll()
 			int on;
 			if (JsonInt(l, "on", on)) gInputOn = on != 0;
 		}
+		if (l.find("\"cmd\":\"paddevs\"") != std::string::npos) DnSetPadDevs(l);
+		if (l.find("\"cmd\":\"socd\"") != std::string::npos) DnSetSocd(l);
 		if (l.find("\"cmd\":\"keymap\"") != std::string::npos) DnSetKeymap(l);
 		if (l.find("\"cmd\":\"hotkeys\"") != std::string::npos) DnSetHotkeys(l);
 		if (l.find("\"cmd\":\"practice\"") != std::string::npos) DnSetPractice(l);
@@ -278,6 +280,7 @@ bool DnIpcPoll()
 		if (l.find("\"cmd\":\"delay\"") != std::string::npos) DnSetDelay(l);
 		if (l.find("\"cmd\":\"volume\"") != std::string::npos) DnSetVolume(l);
 		if (l.find("\"cmd\":\"feed\"") != std::string::npos) DnWatchFeed(l);
+		if (l.find("\"cmd\":\"replay\"") != std::string::npos) DnReplayCmd(l);
 		if (l.find("\"cmd\":\"snap\"") != std::string::npos) DnSnapAsk();
 		if (l.find("\"cmd\":\"state\"") != std::string::npos) DnWatchState(l);
 		if (l.find("\"cmd\":\"rect\"") != std::string::npos) {

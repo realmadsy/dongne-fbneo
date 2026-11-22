@@ -20,6 +20,7 @@ static const char* kRoleInfo[DN_ROLES] = { "up", "down", "left", "right", "start
 static const char* kRoleKey[DN_ROLES] = { "up", "down", "left", "right", "start", "fire1", "fire2", "fire3", "fire4", "fire5", "fire6" };
 static std::vector<int> gRoleCodes[DN_ROLES];
 static bool gKeymapSet = false;			// until the lobby sends one, FBNeo's own mapping drives the roles
+static bool gSocd = false;			// left+right and up+down held together count as neither (DnSetSocd)
 static std::vector<int> gHotkeys;		// per entry: code, fire mask (bit 0 = fire 1), turbo period in frames (0 = plain hotkey)
 static std::vector<int> gTurboPhase;	// per entry: frames since its key went down
 static std::vector<int> gBitRole;		// role of bit k in the local player's word, or -1 (FBNeo mapping: coin, select...)
@@ -90,8 +91,10 @@ static void DnApplyConstants()
 	}
 }
 
+static void DnProbeFromInputs(const uint32_t* in);
 static void DnApplyInputs(const uint32_t* in)
 {
+	DnProbeFromInputs(in);
 	struct BurnInputInfo bii;
 	int want[GGPO_MAX_PLAYERS];
 	for (int p = 0; p < gPlayers; p++) {
@@ -173,9 +176,15 @@ static bool DnSwitch(int code, bool focus)
 // ponytail: a press in the middle of a fight also puts in a coin. Knowing when a game wants one takes per-game RAM addresses.
 enum { DN_ROLE_START = 4, DN_COIN_FRAMES = 6, DN_START_AT = 90, DN_START_END = 96 };
 static uint32_t gCoinMask = 0;		// the local player's coin bit(s)
+static uint32_t gStartMask = 0;		// and start bit(s), for the set's continue (DnSetContinue)
 static int gStartStep = -1;
 static bool gStartWasDown = false;
 static int gFrame = 0;
+// --latency-probe (tools/latency): Scroll Lock (DIK_SCROLL 0x46) read with the frame's input. In a session it rides in bit 27
+// of the local input (no game input there) through GGPO and its delay, so the corner shows on the frame the game gets the
+// press, as a punch would; alone, the frame it was read.
+enum { DN_BIT_PROBE = 27 };
+static bool gProbeDown = false;
 extern int nVidSDisplayStatus;	// vid_directx_support.cpp
 
 uint32_t DnPackLocalInput(bool focus)
@@ -188,6 +197,13 @@ uint32_t DnPackLocalInput(bool focus)
 		}
 	}
 	if (gArgs.testStart && gFrame >= gArgs.testStart && gFrame < gArgs.testStart + 3) keys |= 1u << DN_ROLE_START;
+	// SOCD cleaning (owner 2026-11-22, on unless turned off in the settings): left+right held together is neither, up+down is
+	// neither (the tournament rule; up-priority would let a charge character stand up while still charging). Done to this
+	// player's own input before it goes out, so every peer and spectator plays the same cleaned input.
+	if (gSocd && gKeymapSet) {
+		if ((keys & 0x3) == 0x3) keys &= ~0x3u;		// roles 0 up, 1 down
+		if ((keys & 0xC) == 0xC) keys &= ~0xCu;		// roles 2 left, 3 right
+	}
 
 	const bool startMakesCoin = gKeymapSet && !gArgs.freeCoin && !gArgs.practice;	// practice: the game's own start, no coins
 	bool coin = false;
@@ -249,24 +265,180 @@ static void DnUpdateCtrlBits()
 		for (size_t c = 0; c < gRoleCodes[r].size(); c++) gCtrlBits |= 1u << (gRoleCodes[r][c] < 0x4000 ? DN_BIT_KEYBOARD : DN_BIT_JOYSTICK);
 }
 
+// ---------------------------------------------------------------- joysticks by device, not by number
+// A joystick code carries the pad's number (0x4000 | pad << 8 | control), and DirectInput numbers the pads in whatever order
+// it finds them: after a reboot or on another USB port two pads can swap. The lobby saves which device each saved number
+// was (paddevs, sent before the keymap); here each saved number goes to that device's number now. Once per settings line,
+// never per frame. A device not connected: its codes do nothing, and the lobby is told (pads-moved missing).
+extern int DInputPadInfo(int i, GUID* guid, GUID* product, const WCHAR** name);	// inp_dinput.cpp
+static std::vector<std::pair<int, int>> gPadMove;	// saved number -> number now (-1: not connected)
+static std::vector<int> gUsedPads;		// the pad numbers the keymap and hotkeys use now (DnCheckPads watches these)
+static std::vector<int> gPadDown;		// of those, the ones told lost
+extern int DInputPadLost(int i);		// inp_dinput.cpp: frames in a row it could not be read
+extern void DInputPadSeek(int i, bool on);
+extern int DInputPadSwap();
+extern void DInputPadSeekInfo(int* seen, int* same, int* err);
+static void DnUsedPads()
+{
+	gUsedPads.clear();
+	auto add = [](int c) { if (c >= 0x4000 && c < 0x8000) { const int p = (c >> 8) & 0x3F; if (std::find(gUsedPads.begin(), gUsedPads.end(), p) == gUsedPads.end()) gUsedPads.push_back(p); } };
+	for (int r = 0; r < DN_ROLES; r++) for (int c : gRoleCodes[r]) add(c);
+	for (size_t i = 0; i + 2 < gHotkeys.size(); i += 3) add(gHotkeys[i]);
+}
+void DnSetSocd(const std::string& line)
+{
+	const std::vector<int> v = DnJsonInts(line, "on");
+	gSocd = !v.empty() && v[0] != 0;
+}
+// Every 15 frames: a pad in use that could not be read for 12 frames in a row (0.2 s: a loose cable's blink is not enough)
+// is told lost to the lobby and looked for on the other USB ports (inp_dinput.cpp, its own thread); read again, or found
+// elsewhere and put back in its slot, it is told back. Nothing here runs per frame.
+static void DnCheckPads()
+{
+	const int swapped = DInputPadSwap();
+	for (int p : gUsedPads) {
+		const bool told = std::find(gPadDown.begin(), gPadDown.end(), p) != gPadDown.end();
+		const int lost = DInputPadLost(p);
+		char j[80];
+		if (!told && lost >= 12) {
+			gPadDown.push_back(p);
+			DInputPadSeek(p, true);
+			sprintf(j, "{\"ev\":\"pad-lost\",\"pad\":%d}", p);
+			DnEmit(j);
+		} else if (told && (lost == 0 || p == swapped)) {
+			gPadDown.erase(std::find(gPadDown.begin(), gPadDown.end(), p));
+			DInputPadSeek(p, false);
+			sprintf(j, "{\"ev\":\"pad-back\",\"pad\":%d,\"moved\":%d}", p, p == swapped ? 1 : 0);
+			DnEmit(j);
+		}
+	}
+	// once a second while a pad is down: what the look elsewhere sees (the log shows why a pad does not come back)
+	static int checks = 0;
+	if (!gPadDown.empty() && ++checks % 4 == 0) {
+		int seen, same, err;
+		DInputPadSeekInfo(&seen, &same, &err);
+		char j[96];
+		sprintf(j, "{\"ev\":\"pad-seek\",\"seen\":%d,\"same\":%d,\"err\":%d}", seen, same, err);
+		DnEmit(j);
+	}
+}
+
+static void DnGuidInts(const GUID& g, int* o)	// 8 x 16 bits: the JSON numbers stay small
+{
+	o[0] = (int)(g.Data1 >> 16); o[1] = (int)(g.Data1 & 0xFFFF); o[2] = g.Data2; o[3] = g.Data3;
+	for (int i = 0; i < 4; i++) o[4 + i] = (g.Data4[2 * i] << 8) | g.Data4[2 * i + 1];
+}
+
+static int DnMoveCode(int c)
+{
+	if (c < 0x4000 || c >= 0x8000) return c;
+	const int pad = (c >> 8) & 0x3F;
+	for (size_t i = 0; i < gPadMove.size(); i++)
+		if (gPadMove[i].first == pad) return gPadMove[i].second < 0 ? -1 : (c & ~0x3F00) | (gPadMove[i].second << 8);
+	return c;	// no device saved for it (a setting from before): its number, as before
+}
+
+// The pads as numbered now, each with its device: for the settings (dn:pads) and, from a game, for the lobby to give an old
+// binding its device (one saved before the device was kept) and to count which controllers testers use.
+static void DnEmitPadList()
+{
+	std::string j = "{\"ev\":\"pads\",\"list\":[";
+	for (int i = 0; ; i++) {
+		GUID g, p;
+		const WCHAR* name = NULL;
+		if (DInputPadInfo(i, &g, &p, &name)) break;
+		int gi[8];
+		DnGuidInts(g, gi);
+		char u[MAX_PATH * 3] = "";
+		WideCharToMultiByte(CP_UTF8, 0, name ? name : L"", -1, u, sizeof(u), NULL, NULL);
+		std::string n;
+		for (const char* c = u; *c; c++) if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) n += *c;
+		char e[160];
+		sprintf(e, "%s{\"i\":%d,\"g\":[%d,%d,%d,%d,%d,%d,%d,%d],\"p\":[%d,%d],\"n\":\"", i ? "," : "", i, gi[0], gi[1], gi[2], gi[3], gi[4], gi[5], gi[6], gi[7], (int)(p.Data1 >> 16), (int)(p.Data1 & 0xFFFF));
+		j += e + n + "\"}";
+	}
+	DnEmit((j + "]}").c_str());
+}
+
+void DnSetPadDevs(const std::string& line)
+{
+	const std::vector<int> d = DnJsonInts(line, "d");	// per saved pad: its number, the device GUID (8 x 16 bits), the product's Data1 (2 x 16 bits)
+	gPadMove.clear();
+	std::string moves, missing;
+	for (size_t k = 0; k + 10 < d.size(); k += 11) {
+		int found = -1, same = -1, sameCount = 0;
+		for (int i = 0; ; i++) {
+			GUID g, p;
+			if (DInputPadInfo(i, &g, &p, NULL)) break;
+			int gi[8];
+			DnGuidInts(g, gi);
+			bool eq = true;
+			for (int j = 0; j < 8; j++) eq = eq && gi[j] == d[k + 1 + j];
+			if (eq) { found = i; break; }
+			if ((int)(p.Data1 >> 16) == d[k + 9] && (int)(p.Data1 & 0xFFFF) == d[k + 10]) { same = i; sameCount++; }
+		}
+		if (found < 0 && sameCount == 1) found = same;	// the same model on another USB port gets another GUID: the only one of it
+		gPadMove.push_back(std::make_pair(d[k], found));
+	}
+	// Its device not here: the pad now at the saved number stands in, when no other binding has that one (a controller swapped
+	// for another model still plays), and the lobby says so. Nothing at that number, or taken: its codes do nothing.
+	std::string fallback;
+	for (size_t i = 0; i < gPadMove.size(); i++) {
+		if (gPadMove[i].second >= 0) continue;
+		const int at = gPadMove[i].first;
+		bool taken = DInputPadInfo(at, NULL, NULL, NULL) != 0;
+		for (size_t m = 0; m < gPadMove.size() && !taken; m++) taken = gPadMove[m].second == at;
+		if (taken) { missing += (missing.empty() ? "" : ",") + std::to_string(at); continue; }
+		gPadMove[i].second = at;
+		fallback += (fallback.empty() ? "" : ",") + std::to_string(at);
+	}
+	for (size_t i = 0; i < gPadMove.size(); i++) moves += (i ? "," : "") + std::to_string(gPadMove[i].first) + "," + std::to_string(gPadMove[i].second);
+	DnEmit(("{\"ev\":\"pads-moved\",\"moves\":[" + moves + "],\"missing\":[" + missing + "],\"fallback\":[" + fallback + "]}").c_str());
+	DnEmitPadList();
+}
+
 void DnSetKeymap(const std::string& line)
 {
-	for (int r = 0; r < DN_ROLES; r++) gRoleCodes[r] = DnJsonInts(line, kRoleKey[r]);
+	for (int r = 0; r < DN_ROLES; r++) {
+		std::vector<int> v;
+		for (int c : DnJsonInts(line, kRoleKey[r])) { c = DnMoveCode(c); if (c >= 0) v.push_back(c); }
+		// a direction on a pad's stick (controls 0-3: left right up down, half-way tilt) also takes its d-pad (0x10-0x13) and
+		// the other way round: an arcade stick's DP/LS switch moved by accident no longer loses the lever (owner 2026-11-22)
+		if (r < 4) {
+			const size_t n = v.size();
+			for (size_t i = 0; i < n; i++) {
+				const int c = v[i], ctl = c & 0xFF;
+				if (c < 0x4000 || c >= 0x8000 || !(ctl < 4 || (ctl >= 0x10 && ctl < 0x14))) continue;
+				const int twin = (c & ~0xFF) | (ctl < 4 ? 0x10 + ctl : ctl - 0x10);
+				if (std::find(v.begin(), v.end(), twin) == v.end()) v.push_back(twin);
+			}
+		}
+		gRoleCodes[r] = v;
+	}
 	gKeymapSet = true;
+	DnUsedPads();
 	DnUpdateCtrlBits();
 	DnEmitKeys();
 }
 
 void DnSetHotkeys(const std::string& line)
 {
-	gHotkeys = DnJsonInts(line, "hk");
+	const std::vector<int> hk = DnJsonInts(line, "hk");
+	gHotkeys.clear();
+	for (size_t i = 0; i + 2 < hk.size(); i += 3) {
+		const int c = DnMoveCode(hk[i]);
+		if (c < 0) continue;	// its device is not connected
+		gHotkeys.push_back(c); gHotkeys.push_back(hk[i + 1]); gHotkeys.push_back(hk[i + 2]);
+	}
 	gTurboPhase.clear();
+	DnUsedPads();
 	if (gKeymapSet) DnUpdateCtrlBits();
 	DnEmitKeys();
 }
 
 // ---------------------------------------------------------------- state
 
+int nDnNetplay = 0;	// scrn.cpp is_netgame_or_recording: a net game from the driver's start (DnStart)
 static UINT8* gScanPtr = NULL;
 static INT32 gScanLen = 0;
 
@@ -282,10 +454,36 @@ static int DnStateSize()
 	return gScanLen + (int)sizeof(UINT32) + (int)sizeof(gSeat);
 }
 
-static uint32_t Fnv1a(const UINT8* p, int n)
+// The state's hash (FNV-1a; GGPO's checksum, the spectators' check every 300th frame) leaves out what a driver only works out while
+// drawing: a frame run unseen (a rollback's re-run, a spectator catching up) keeps the last drawn values there, which change
+// nothing in the game (the next draw works them out again) but would tell a false drift (2026-11-22: ssriders' K052109
+// scroll copies). The state itself is whole; only the hash skips these. Found by name once, at the first save.
+static const char* const kDrawOnly[] = { "K052109ScrollX", "K052109ScrollY", "K052109EnableRows", "K052109EnableLine", "K052109ScrollRows", "K052109EnableCols", "K052109ScrollCols" };
+static std::vector<std::pair<int, int> > gHashSkip;	// [offset, length) in cbSave's bytes
+static bool gHashSkipReady = false;
+static INT32 gSkipAt = 0;
+static INT32 __cdecl DnSkipAcb(struct BurnArea* pba)
 {
+	for (size_t i = 0; pba->szName && i < sizeof(kDrawOnly) / sizeof(kDrawOnly[0]); i++)
+		if (!strcmp(pba->szName, kDrawOnly[i])) { gHashSkip.push_back(std::make_pair((int)gSkipAt, (int)pba->nLen)); break; }
+	gSkipAt += pba->nLen;
+	return 0;
+}
+static uint32_t DnStateHashOf(const UINT8* p, int n)
+{
+	if (!gHashSkipReady) {
+		gHashSkipReady = true;
+		gSkipAt = sizeof(UINT32) + sizeof(gSeat);
+		BurnAcb = DnSkipAcb;
+		BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_READ, NULL);
+	}
 	uint32_t h = 2166136261u;
-	while (n--) { h ^= *p++; h *= 16777619u; }
+	int at = 0;
+	for (size_t i = 0; i <= gHashSkip.size(); i++) {
+		const int end = i < gHashSkip.size() ? gHashSkip[i].first : n;
+		for (; at < end && at < n; at++) { h ^= p[at]; h *= 16777619u; }
+		if (i < gHashSkip.size()) at = gHashSkip[i].first + gHashSkip[i].second;
+	}
 	return h;
 }
 
@@ -377,7 +575,7 @@ static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 	BurnAreaScan(ACB_FULLSCAN | ACB_NET_OPT | ACB_READ, NULL);
 	*buffer = buf;
 	*len = n;
-	*checksum = (int)Fnv1a(buf, n);
+	*checksum = (int)DnStateHashOf(buf, n);
 	if (gSession) { DnRecordHash((int)nCurrentFrame, (uint32_t)*checksum); DnSnapKeep((int)nCurrentFrame, buf, n); }
 	return true;
 }
@@ -457,6 +655,8 @@ static bool __cdecl cbBegin(const char*) { return true; }
 // ---------------------------------------------------------------- frames
 
 static void DnBoutCheck();
+static uint32_t DnSetContinue();
+static int gSetWon[2] = { -1, -1 };	// a push-out set: the bouts each side has won, from its first bout told (DnSetTold)
 static int gBoutEndAt = -1;	// --bout-end: the frame the game ends on, once a bout is told
 static void DnStepFrame(bool draw)
 {
@@ -636,13 +836,13 @@ static bool DnWatchApply()
 	return true;
 }
 
-// What each player holds, for the spectator's input panel: direction as on a number pad (5 = none), fire buttons as bits.
-static void DnEmitWatchInputs()
+// What each player holds, for the input panel: direction as on a number pad (5 = none), fire buttons as bits. Spectators
+// from the feed, players (2026-11-22) from this frame's synchronized inputs; queued (DnEmit), every 4th picture.
+static void DnEmitHeld(const uint32_t* words)
 {
-	const size_t at = (size_t)((int)nCurrentFrame - gFeedBase) * gPlayers;
 	std::string j = "{\"ev\":\"watch-in\",\"frame\":" + std::to_string(gFrame) + ",\"checked\":" + std::to_string(gWatchChecked) + ",\"p\":[";
 	for (int p = 0; p < gPlayers; p++) {
-		const uint32_t w = gFeed[at + p];
+		const uint32_t w = words[p];
 		bool up = false, down = false, left = false, right = false;
 		int fire = 0;
 		for (size_t k = 0; k < gBitRole.size(); k++) {
@@ -657,6 +857,7 @@ static void DnEmitWatchInputs()
 	j += "]}";
 	DnEmit(j.c_str());
 }
+static void DnEmitWatchInputs() { DnEmitHeld(&gFeed[(size_t)((int)nCurrentFrame - gFeedBase) * gPlayers]); }
 
 // How far this spectator is from the live match (the server's end of the feed): far behind (came in late) the lobby
 // covers the game with "따라잡는 중" while it runs ahead unseen, and uncovers it on watch-live.
@@ -678,6 +879,100 @@ static void DnWatchBehind(int live, int f)
 		live_told = true;
 		DnEmit("{\"ev\":\"watch-live\"}");
 	}
+}
+
+// A replay (--replay): the lobby hands over the whole recorded feed, so nothing waits for the line. The controls are
+// {"cmd":"replay"}: pause / play, speed in tenths (1, 2, 5 = slower, every 10th / 5th / 2nd tick; 20..160 = faster,
+// the frames between run unseen), step (one frame while paused), seek (any frame: back from the nearest of the states
+// kept every 300 frames, then forward unseen). The position goes out as {"ev":"replay-pos"} a few times a second.
+enum { DN_REPLAY_KEEP = 300 };
+static bool gReplayPaused = false;
+static bool gReplayTell = false;	// a control came: the next position goes out at once
+static int gReplaySpeed = 10, gReplayStep = 0, gReplaySeek = -1, gReplayTick = 0;
+static std::vector<std::pair<int, std::vector<UINT8> > > gReplayKept;	// frame, the state at its start
+void DnReplayCmd(const std::string& line)
+{
+	if (!gArgs.replay) return;
+	const std::string op = DnJsonText(line, "op");
+	std::vector<int> x = DnJsonInts(line, "x");
+	gReplayTell = true;
+	if (op == "pause") gReplayPaused = true;
+	else if (op == "play") gReplayPaused = false;
+	else if (op == "speed" && !x.empty() && x[0] >= 1 && x[0] <= 160) { gReplaySpeed = x[0]; gReplayTick = 0; }
+	else if (op == "step" && !x.empty()) { if (x[0] > 0) gReplayStep += x[0]; else gReplaySeek = (int)nCurrentFrame + x[0] - 1; }	// back: to the frame before, shown
+	else if (op == "seek" && !x.empty()) gReplaySeek = x[0];
+}
+static void DnReplayPos(int f, int end, bool now)	// f: the frames played so far (the next one to play)
+{
+	static int told = -1;
+	if (f == told && !gReplayTell) return;
+	if (!now &&!gReplayTell && f - told < 15 && f >= told) return;
+	gReplayTell = false;
+	told = f;
+	char j[160];
+	sprintf(j, "{\"ev\":\"replay-pos\",\"f\":%d,\"base\":%d,\"end\":%d,\"paused\":%d,\"speed\":%d}", f, gFeedBase, end, gReplayPaused ? 1 : 0, gReplaySpeed);
+	DnEmit(j);
+}
+static void DnReplayKeep()
+{
+	const int f = (int)nCurrentFrame;
+	if ((f - gFeedBase) % DN_REPLAY_KEEP) return;
+	for (size_t i = 0; i < gReplayKept.size(); i++) if (gReplayKept[i].first == f) return;
+	unsigned char* b = NULL;
+	int n = 0, c = 0;
+	if (!cbSave(&b, &n, &c, 0)) return;
+	gReplayKept.push_back(std::make_pair(f, std::vector<UINT8>(b, b + n)));
+	free(b);
+}
+static void DnReplayUnseen()	// one frame of the match, not shown
+{
+	DnReplayKeep();
+	DnWatchApply();
+	DnStepFrame(false);
+	gFrame++;
+}
+static int DnReplayInput()
+{
+	if (gFeedBase < 0) return 1;	// nothing handed over yet
+	const int end = gFeedBase + (int)(gFeed.size() / gPlayers);	// the first frame with no inputs
+	static bool started = false, ended = false;
+	if (!started) {
+		started = true;
+		if ((int)nCurrentFrame != gFeedBase) { DnEmitError("watch_start", "the recording starts on another frame than this game"); return 1; }
+		DnEmit("{\"ev\":\"watch-playing\"}");
+	}
+	if (gReplaySeek >= 0) {
+		int to = gReplaySeek;
+		gReplaySeek = -1;
+		if (to < gFeedBase) to = gFeedBase;
+		if (to > end - 1) to = end - 1;
+		if (to < (int)nCurrentFrame) {	// back: the latest kept state at or before it
+			int best = -1;
+			for (size_t i = 0; i < gReplayKept.size(); i++) if (gReplayKept[i].first <= to && (best < 0 || gReplayKept[i].first > gReplayKept[best].first)) best = (int)i;
+			if (best < 0) return 1;
+			cbLoad(gReplayKept[best].second.data(), (int)gReplayKept[best].second.size());
+		}
+		while ((int)nCurrentFrame < to) DnReplayUnseen();	// the frame asked for is the next one shown
+		ended = false;
+		gReplayTick = 0;
+		if (gReplayPaused) gReplayStep = 1;
+	}
+	const int f = (int)nCurrentFrame;
+	if (f >= end) {
+		if (!ended) { ended = true; DnReplayPos(end, end, true); DnEmit("{\"ev\":\"replay-end\"}"); }
+		return 1;
+	}
+	if (gReplayPaused && gReplayStep <= 0) { DnReplayPos(f, end, true); return 1; }
+	if (!gReplayPaused && gReplaySpeed < 10 && (gReplayTick++ % (10 / gReplaySpeed))) return 1;	// slower: this tick shows the last frame again
+	if (!gReplayPaused && gReplaySpeed > 10)
+		for (int k = gReplaySpeed / 10 - 1; k > 0 && (int)nCurrentFrame < end - 1; k--) DnReplayUnseen();	// faster
+	if (gReplayStep > 0) gReplayStep--;
+	DnReplayKeep();
+	DnWatchApply();
+	DnEmitSeats();
+	if (gFrame % 4 == 0) DnEmitWatchInputs();
+	DnReplayPos((int)nCurrentFrame + 1, end, gReplayPaused);
+	return 0;
 }
 
 // A spectator's frame: waits for half a second of feed before it plays (and again after running dry), and when far
@@ -898,6 +1193,10 @@ static int DnLoadGame(const DnArgs& a)
 	}
 	extern INT32 nDnIpsApplied;
 	nDnIpsApplied = 0;
+	// The driver starts as a net game (2026-11-22): its random seed (BurnRandomInit) and clock (BurnGetLocalTime) are the
+	// fixed ones on every PC, players, spectators and the lone game alike. kNetGame comes later (it would call Kaillera in
+	// DrvInit), so before this a spectator's ssriders/wofj seeded from the time and its state hash told a drift at frame 300.
+	nDnNetplay = 1;
 	if (DrvInit(nGame, false) || !bDrvOkay) {
 		DnEmitError("rom_missing", ("cannot load " + a.game).c_str());
 		return DN_EXIT_ROM;
@@ -955,6 +1254,13 @@ static GGPOPlayerHandle gHandle[GGPO_MAX_PLAYERS];
 static GGPOPlayerHandle gLocal;
 static int gRemoteAlive = 0;
 static bool gAlone = false;
+static void DnProbeFromInputs(const uint32_t* in)	// the frame's inputs as the game gets them (after GGPO's delay)
+{
+	if (!gArgs.latencyProbe || gAlone || gArgs.me < 1) return;
+	const bool d = (in[gArgs.me - 1] >> DN_BIT_PROBE) & 1;
+	if (d != gProbeDown) DnFrameLog(d ? 'P' : 'p');	// tests: when the game got it (with --frame-log)
+	gProbeDown = d;
+}
 static int gFramesAhead = 0;
 static int gHeldFrames = 0, gStalledFrames = 0;	// since the last stats line: held for time sync / waiting on the peer's input
 static bool gEnding = false;
@@ -1060,8 +1366,12 @@ int DnP2PLoad()
 	// MediaInit() falls back to DirectSound if WASAPI can't start. Before the game loads: its sound chips are set up for
 	// this rate, and running them at another one writes past their buffers. One fixed rate, whatever the settings file
 	// or the fallback, because the rate is part of what rollback saves: every peer needs the same one.
+	if (gArgs.vidSelect >= 0) nVidSelect = (UINT32)gArgs.vidSelect;	// tests (tools/latency)
+	if (gArgs.dwmSync >= 0) bVidDWMSync = gArgs.dwmSync != 0;
 	nAudSelect = 2;
 	nAudSegCount = 4;
+	if (gArgs.audSelect >= 0) nAudSelect = gArgs.audSelect;	// tests (tools/latency audio)
+	if (gArgs.audSegs >= 0) nAudSegCount = gArgs.audSegs;
 	nAudSampleRate[0] = nAudSampleRate[2] = 48000;
 
 	if ((gExitCode = DnLoadGame(gArgs)) != 0) return 1;
@@ -1069,7 +1379,10 @@ int DnP2PLoad()
 	gAlone = gPlayers == 1 || gArgs.practice || gArgs.watch;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
 	if (gArgs.practice) DnSetPractice(gArgs.practiceSet);
 	if (!gAlone) {
-		if (!DnPortFree(gArgs.localPort)) {
+		int portTries = 0;
+		while (!DnPortFree(gArgs.localPort) && ++portTries < 40) Sleep(50);	// up to 2 s: held only a moment (before the game starts, so no lag)
+		if (portTries) { char j[96]; sprintf(j, "{\"ev\":\"port-wait\",\"tries\":%d}", portTries); DnEmit(j); }	// for the match log
+		if (portTries >= 40) {
 			DnEmitError("port_in_use", ("udp port " + std::to_string(gArgs.localPort)).c_str());
 			gExitCode = DN_EXIT_PORT;
 			return 1;
@@ -1116,6 +1429,7 @@ int DnP2PLoad()
 			BurnDrvGetInputInfo(&bii, gPlayerInp[gArgs.me - 1][k]);
 			size_t n = bii.szInfo ? strlen(bii.szInfo) : 0;
 			if (n >= 5 && !_stricmp(bii.szInfo + n - 5, " coin")) gCoinMask |= 1u << k;
+			if (n >= 6 && !_stricmp(bii.szInfo + n - 6, " start")) gStartMask |= 1u << k;
 		}
 		for (size_t i = 0; i < sizeof(kCredits) / sizeof(kCredits[0]); i++) {
 			if (gArgs.game == kCredits[i].game) gCreditAddr = kCredits[i].credits;
@@ -1151,7 +1465,7 @@ static uint32_t DnBotInput()
 	static uint32_t v = 0;
 	static int hold = 0, coinFrames = 0, coinWait = 0;
 	if (!gAutoHuman || --hold <= 0) {
-		v = XorShift(gAutoRng) & DN_GAME_BITS & ~DN_SEAT_BITS & (gAutoHuman ? ~gCoinMask : ~0u);
+		v = XorShift(gAutoRng) & DN_GAME_BITS & ~DN_SEAT_BITS & (gAutoHuman ? ~gCoinMask : ~0u) & (gArgs.setFirst && gSetWon[0] >= 0 ? ~gStartMask : ~0u);	// a set: after its first bout, start only from DnSetContinue (tests)
 		hold = 4 + XorShift(gAutoRng) % 12;
 	}
 	if (!gAutoHuman) return v;
@@ -1388,6 +1702,12 @@ static void DnPracticeBoxesOf(UINT8* img, int w, int h, int bpp, int pitch, UINT
 }
 void DnPracticeOverlay(UINT8* img, int w, int h, int bpp, int pitch)
 {
+	if (gArgs.latencyProbe && img) {	// tests (tools/latency): a 24x24 corner, white while the probe key was down in this frame's input
+		const UINT32 c = gProbeDown ? BurnHighCol(255, 255, 255, 0) : BurnHighCol(0, 0, 0, 0);
+		for (int y = 0; y < 24 && y < h; y++) for (int x = 0; x < 24 && x < w; x++) PrPixel(img, w, h, bpp, pitch, x, y, c);
+		// and the sound: silence, or a loud square wave (750 Hz) while the key was down, so the tool hears when it comes out
+		if (pBurnSoundOut) for (int i = 0; i < nBurnSoundLen; i++) pBurnSoundOut[i * 2] = pBurnSoundOut[i * 2 + 1] = gProbeDown ? ((i / 32) & 1 ? 24000 : -24000) : 0;
+	}
 	if (!gArgs.practice || gArgs.game != "sf2ce" || !img || !PrWord(PR_P2 + PR_HP)) return;
 	if (gPrBoxes) {		// the chosen side's fighter and its fireball
 		const UINT32 base = gPrBoxSide == 2 ? PR_P2 : PR_P1, ball = (UINT32)PrWord(base + PR_BALL);
@@ -1605,6 +1925,30 @@ static void DnPracticeFrame(uint32_t local, uint32_t* in)
 }
 
 // --script: frame,length,roles;... the player's presses, for tests.
+// Fightcade's "Fix dropped inputs": a lever going from one diagonal straight to the next one across a direction (down-back to
+// down-forward, up-back to up-forward, down-back to up-back, down-forward to up-forward) skipped the direction between them
+// (a sampled frame fell on neither side of it), and a motion like a fireball then never sees its down. That direction is
+// put in for one frame and the new diagonal follows on the next. On the local player's input, before GGPO: every PC plays
+// the same frames. Off unless the lobby asks (--fix-dirs 1).
+static uint32_t DnFixDirs(uint32_t local)
+{
+	if (!gArgs.fixDirs) return local;
+	static int prev = 0;
+	int bit[4] = { -1, -1, -1, -1 };	// roles 0-3: up, down, left, right
+	for (size_t k = 0; k < gBitRole.size() && k < 32; k++) if (gBitRole[k] >= 0 && gBitRole[k] < 4) bit[gBitRole[k]] = (int)k;
+	int cur = 0;
+	for (int r = 0; r < 4; r++) if (bit[r] >= 0 && ((local >> bit[r]) & 1)) cur |= 1 << r;
+	auto diag = [](int d) { const int v = d & 3, h = d & 12; return v && v != 3 && h && h != 12; };
+	int out = cur;
+	if (diag(prev) && diag(cur) && prev != cur) {
+		const int same = prev & cur;	// the direction both diagonals hold: the one skipped between them
+		if (same == 1 || same == 2 || same == 4 || same == 8) out = same;
+	}
+	prev = out;
+	if (out != cur) for (int r = 0; r < 4; r++) if (bit[r] >= 0) { if ((out >> r) & 1) local |= 1u << bit[r]; else local &= ~(1u << bit[r]); }
+	return local;
+}
+
 static uint32_t DnScriptInput(const std::string& script, int f)
 {
 	struct Press { int frame, len; uint32_t bits; };
@@ -1636,7 +1980,7 @@ static int DnPracticeTest(const DnArgs& a)
 	DnFastStart();
 	int lastState = -1;
 	for (int f = 0; f < a.frames; f++) {
-		uint32_t local = DnScriptInput(a.script, f), in[GGPO_MAX_PLAYERS] = { 0 };
+		uint32_t local = DnFixDirs(DnScriptInput(a.script, f)), in[GGPO_MAX_PLAYERS] = { 0 };
 		DnPracticeInput(local, f);
 		if (a.game == "sf2ce") DnPracticeFrame(local, in); else in[0] = local;
 		DnApplyInputs(in);
@@ -1674,6 +2018,7 @@ int DnNetGetInput()
 	if (gArgs.testSlow && gFrame % 30 == 29) Sleep(gArgs.testSlow);
 	static bool fastStarted = false;
 	if (gArgs.fastStart && !fastStarted) { fastStarted = true; DnFastStart(); }	// before GGPO saves its first frame
+	if (gArgs.replay) return DnReplayInput();
 	if (gArgs.watch) return DnWatchInput();
 	// GGPO says we're ahead of the peer by gFramesAhead frames: pay it back one held frame at a time, at least
 	// 10 frames apart. Holding them all in a row froze the picture for 50-70 ms (measured with tools/netsim.js).
@@ -1696,8 +2041,14 @@ int DnNetGetInput()
 			DnEmit(j);
 		}
 	}
+	const bool probeKey = gArgs.latencyProbe && InputReadSwitch(0x46) != 0;
+	if (gArgs.latencyProbe && gAlone) gProbeDown = probeKey;
 	uint32_t local = !gArgs.script.empty() ? DnScriptInput(gArgs.script, gFrame) | gCtrlBits : gAutoRng ? DnBotInput() : ((DnInputOn() ? DnPackLocalInput(DnHasInputFocus()) : 0) | gCtrlBits);	// the controller shows either way
+	local |= DnSetContinue();	// a push-out set: the loser's continue (nothing otherwise)
+	if (!gAutoRng) local = DnFixDirs(local);	// the player's own presses (and a test's script), not a bot's
 	local = DnWithSeatRequest(local);
+	if (probeKey && !gAlone) local |= 1u << DN_BIT_PROBE;
+	{ static bool was = false; if (gArgs.latencyProbe && probeKey != was) { was = probeKey; DnFrameLog(probeKey ? 'K' : 'k'); } }	// tests: when it was read
 	if (gArgs.practice) DnPracticeInput(local, gFrame);
 	if (gArgs.practice && gArgs.game == "sf2ce") {
 		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
@@ -1725,6 +2076,7 @@ int DnNetGetInput()
 	DnRecord(in);
 	DnApplyInputs(in);
 	DnEmitSeats();
+	if (gFrame % 4 == 0) DnEmitHeld(in);	// the players' input panel (the peer's part may be a prediction; display only)
 	return 0;
 }
 
@@ -1732,12 +2084,53 @@ int DnNetGetInput()
 // player's won rounds at the player block + 0x290 (1P 0xFF864E, 2P 0xFF894E; found by diffing RAM over a long random
 // match): one reaching 2 has won the bout, and both go back to 0 when the next one starts. Told once it has held for a
 // second, so a rollback can no longer take it back; spectators tell it too, from the same frames.
+// A push-out set (--set-first, owner 2026-11-22): the game is not closed and opened again between the bouts of a set. A
+// bout told counts for its side; the one that decides the set ends the game after the win pose (--bout-end), as every
+// bout did before. Otherwise the side that lost (both on a draw) continues on its own PC: coin and start pressed for it
+// as its player would (real input, so the other PC, the spectators and the replay get it as any press), every 2.5 s from
+// 1 s after the bout is told until the next fight is under way, so both are back on character select, not the winner
+// against the computer. Given up after 12 tries (30 s): the game is then ended, and the room starts the bout again.
+static int gContinueAt = -1;
+static bool gFightOn = false;
+static void DnSetTold(int winner)
+{
+	if (!gArgs.boutEnd) return;
+	if (!gArgs.setFirst) { gBoutEndAt = (int)nCurrentFrame + gArgs.boutEnd; return; }
+	if (gSetWon[0] < 0) { gSetWon[0] = gArgs.setWon[0]; gSetWon[1] = gArgs.setWon[1]; }
+	if (winner >= 1 && winner <= 2 && ++gSetWon[winner - 1] >= gArgs.setFirst) { gBoutEndAt = (int)nCurrentFrame + gArgs.boutEnd; return; }
+	const int mySide = gArgs.me > 0 ? gSeat[gArgs.me - 1] + 1 : 0;
+	if (!gArgs.watch && !gArgs.replay && (winner == 0 || winner != mySide)) { gContinueAt = gFrame + 60; }
+}
+static uint32_t DnSetContinue()
+{
+	if (gContinueAt < 0) return 0;
+	if (gFightOn) { gContinueAt = -1; return 0; }	// the next fight is on: done
+	const int t = gFrame - gContinueAt;
+	if (t < 0) return 0;
+	const int step = t % 150;
+	if (step == 0 && t / 150 >= 12) { gContinueAt = -1; gBoutEndAt = (int)nCurrentFrame + 1; return 0; }	// never came back: ended, the room plays it again
+	if (step < DN_COIN_FRAMES) return gCoinMask;
+	if (step >= DN_START_AT && step < DN_START_END) return gStartMask;
+	return 0;
+}
+
 static void DnBoutCheck()
 {
 	bool team = false;	// a game of team battles: a bout is a whole battle
 	if ((gArgs.game != "sf2ce" && !team) || gArgs.practice) return;
 	static int last = 0, held = 0, fightWinner = 0, fights = 0;
 	static bool told = false;
+	// A bout under way, for the records' quits (server/room-server.js quitCheck): on once both fighters have had health
+	// (fighter + 0x2a: 0 outside a fight, 144 full, 0 or below when knocked out; the same in the 3:3 edition) for half a
+	// second, off when the bout is told. Between rounds of a bout it stays on: leaving after a lost round is still a quit.
+	static bool inBout = false;
+	static int upHeld = 0;
+	auto boutOver = []() { inBout = false; gFightOn = false; upHeld = 0; DnEmit("{\"ev\":\"fight\",\"on\":0}"); };
+	if (!inBout) {
+		const int h1 = (INT16)ReadValueAtHardwareAddress(0xFF83E8, 2, 0), h2 = (INT16)ReadValueAtHardwareAddress(0xFF86E8, 2, 0);
+		if (h1 > 0 && h1 <= 0x90 && h2 > 0 && h2 <= 0x90) { if (++upHeld == 30) { inBout = true; gFightOn = true; DnEmit("{\"ev\":\"fight\",\"on\":1}"); } }
+		else upHeld = 0;
+	}
 	const int need = team ? 1 : 2;
 	if (team) {
 		const int n = (int)ReadValueAtHardwareAddress(0xFF0F0B, 1, 0);
@@ -1745,7 +2138,10 @@ static void DnBoutCheck()
 			char j[80];
 			sprintf(j, "{\"ev\":\"bout\",\"winner\":%d,\"frame\":%d}", fightWinner, (int)nCurrentFrame);
 			DnEmit(j);
+			const int w = fightWinner;
 			fightWinner = 0;
+			boutOver();
+			DnSetTold(w);	// a push-out bout: the game ends after the battle, as sf2ce's does (or the set goes on)
 		}
 		fights = n;
 	}
@@ -1758,13 +2154,15 @@ static void DnBoutCheck()
 		char j[80];
 		sprintf(j, "{\"ev\":\"bout\",\"winner\":%d,\"frame\":%d}", won == 3 ? 0 : won, (int)nCurrentFrame);	// 0: both, a draw
 		DnEmit(j);
-		if (gArgs.boutEnd) gBoutEndAt = (int)nCurrentFrame + gArgs.boutEnd;
+		boutOver();
+		DnSetTold(won == 3 ? 0 : won);
 	}
 }
 
 void DnNetAdvanceFrame()
 {
 	DnBoutCheck();	// players, playing alone and spectators alike
+	if (!gArgs.watch && (int)nCurrentFrame % 15 == 0 && !gUsedPads.empty()) DnCheckPads();	// the pads in use, every quarter second
 	if (gBoutEndAt >= 0 && (int)nCurrentFrame >= gBoutEndAt) { DnEnd("bout"); return; }	// every peer on the same frame
 	if (!gSession && !gAlone) return;
 	static FILE* dump = gArgs.soundDump.empty() ? NULL : _wfopen(gArgs.soundDump.c_str(), L"wb");
@@ -1824,11 +2222,14 @@ void DnNetIdle()
 	if (now - gLastStats < 1000) return;
 	gLastStats = now;
 	int worstPing = -1;		// 3-4 players: the farthest one decides
+	int worstAhead = -100;	// how far ahead of the farthest-behind peer we run (GGPO's two advantages, as its timesync)
 	for (int p = 0; p < gPlayers; p++) {
 		if (gHandle[p] == gLocal) continue;
 		GGPONetworkStats st;
 		if (!GGPO_SUCCEEDED(ggpo_get_network_stats(gSession, gHandle[p], &st))) continue;
 		if (st.network.ping > worstPing) worstPing = st.network.ping;
+		const int ahead = st.timesync.remote_frames_behind - st.timesync.local_frames_behind;
+		if (ahead > worstAhead) worstAhead = ahead;
 		char j[192];
 		sprintf(j, "{\"ev\":\"stats\",\"player\":%d,\"ping\":%d,\"framesAhead\":%d,\"rollbackFrames\":%d,\"held\":%d,\"stalled\":%d,\"frame\":%d,\"kbps\":%d}",
 			p + 1, st.network.ping, st.timesync.remote_frames_behind, gRollbackFrames, gHeldFrames, gStalledFrames, gFrame, st.network.kbps_sent);
@@ -1836,6 +2237,18 @@ void DnNetIdle()
 	}
 	gRollbackFrames = 0;
 	gHeldFrames = gStalledFrames = 0;
+	// balance (on unless --balance 0; owner 2026-11-22): GGPO holds the side ahead only from 3 frames (MIN_FRAME_ADVANTAGE), so a side 1-2
+	// frames ahead keeps it and takes most of the rollbacks. Over 4 seconds' samples: a frame or more ahead, one frame
+	// held (the pay-back above spaces holds 10 frames apart), at most once in 2 seconds.
+	if (gArgs.balance && worstAhead > -100) {
+		static int samples[4] = { 0 }, n = 0, quiet = 0;
+		samples[n++ % 4] = worstAhead;
+		if (quiet > 0) quiet--;
+		if (n >= 4 && quiet == 0 && gFramesAhead == 0) {
+			const float avg = (samples[0] + samples[1] + samples[2] + samples[3]) / 4.0f;
+			if (avg >= 2.0f) { gFramesAhead = 1; quiet = 4; }	// clearly ahead (a frame each side off), at most once in 4 s: no see-saw
+		}
+	}
 
 	if (gArgs.delay < 0 && gAutoCount < DN_AUTO_SAMPLES && worstPing >= 0 && gAutoSkipped++ >= DN_AUTO_SKIP) {
 		gAutoPings[gAutoCount++] = worstPing;
@@ -1871,6 +2284,7 @@ static int DnPads()
 		return DN_EXIT_OTHER;
 	}
 	DnEmit("{\"ev\":\"ready\"}");
+	DnEmitPadList();	// which device each pad number is: saved with a binding, so it follows its device (DnSetPadDevs)
 	InputFind(3);			// poll, and take the resting axes (sticks, triggers) as the baseline
 	int last = -1;
 	while (!DnIpcPoll() && !DnStdinClosed()) {

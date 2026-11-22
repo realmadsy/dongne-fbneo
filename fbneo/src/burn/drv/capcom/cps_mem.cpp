@@ -456,7 +456,10 @@ INT32 CpsAreaScan(INT32 nAction, INT32 *pnMin)
 
 	if (((Cps == 2) && !Cps2DisableQSnd) || Cps1Qs == 1) {						// Scan QSound chips
 		if (CpsSoundScanCallbackFunction) CpsSoundScanCallbackFunction(nAction, pnMin);
-		else QsndScan(nAction);
+		// dn: rollback and run-ahead put the state back mid-match: the resampler's position between the chip's samples
+		// (nDelta) must come back too, or the chip steps a different number of times, its ready flag reaches the Z80 at
+		// another moment and the sound CPU (then the RAM it shares with the 68000) drifts from the other PC (wofj, 2026-11-22)
+		else QsndScan(nAction, (nAction & (ACB_NET_OPT | ACB_RUNAHEAD)) ? 1 : 0);
 	} else {											// Scan PSound chips
 		if ((Cps & 1) && !Cps1DisablePSnd) PsndScan(nAction, pnMin);
 	}
