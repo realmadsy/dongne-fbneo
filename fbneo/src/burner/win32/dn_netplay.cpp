@@ -2250,15 +2250,20 @@ void DnNetIdle()
 		}
 	}
 
-	if (gArgs.delay < 0 && gAutoCount < DN_AUTO_SAMPLES && worstPing >= 0 && gAutoSkipped++ >= DN_AUTO_SKIP) {
+	// --delay-trim (2026-11-22): the lobby's pick came from a few probes before the game, which a busy moment can push up (4
+	// frames on a line the game pinged at 47 ms). The same samples as auto: a pick above what the game's ping calls for is
+	// lowered once (only when 2+ frames too high), in the first seconds (character select), never raised.
+	if ((gArgs.delay < 0 || gArgs.delayTrim) && gAutoCount < DN_AUTO_SAMPLES && worstPing >= 0 && gAutoSkipped++ >= DN_AUTO_SKIP) {
 		gAutoPings[gAutoCount++] = worstPing;
 		if (gAutoCount == DN_AUTO_SAMPLES) {
 			std::sort(gAutoPings, gAutoPings + DN_AUTO_SAMPLES);
 			int ping = gAutoPings[DN_AUTO_SAMPLES / 2], d = DnAutoDelay(ping);
-			ggpo_set_frame_delay(gSession, gLocal, d);
-			char j[96];
-			sprintf(j, "{\"ev\":\"delay\",\"frames\":%d,\"auto\":true,\"ping\":%d}", d, ping);
-			DnEmit(j);
+			if (gArgs.delay < 0 || d <= gArgs.delay - 2) {	// two frames or more too many: a one-frame call at the edge could split the sides 0/1
+				ggpo_set_frame_delay(gSession, gLocal, d);
+				char j[112];
+				sprintf(j, "{\"ev\":\"delay\",\"frames\":%d,\"auto\":true,\"ping\":%d%s}", d, ping, gArgs.delay < 0 ? "" : ",\"trim\":true");
+				DnEmit(j);
+			}
 		}
 	}
 }

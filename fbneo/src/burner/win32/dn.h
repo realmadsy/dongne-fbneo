@@ -22,6 +22,7 @@ struct DnArgs {
 	bool watch = false;		// --watch 1: a spectator: no session, the players' confirmed inputs come from the lobby ({"cmd":"feed"})
 	bool fastStart = false;	// --fast-start 1: skip the boot, open on character select (DnFastStart)
 	int vidSelect = -1, dwmSync = -1, audSelect = -1, audSegs = -1;	// --aud-select / --aud-segs (tests): 0 DirectSound, 2 WASAPI; frames of buffer	// --vid-select / --dwm-sync (tests): the blitter (0 DDraw, 2 DDrawFX, 3 DX9, 4 DX9 Alt, 5 D3D11) and FBNeo's "sync to DWM", over the settings file
+	bool delayTrim = false;	// --delay-trim 1: the lobby's auto pick (from its probes) is lowered once if the game's own ping says less
 	bool balance = true;	// hold a frame when 2+ frames ahead of the peer, not only from 3 (GGPO): rollbacks split evenly (owner 2026-11-22: on); --balance 0 turns it off
 	bool fixDirs = false;	// --fix-dirs 1: a direction skipped between two diagonals is put in for a frame (DnFixDirs)
 	bool latencyProbe = false;	// --latency-probe 1 (tests): the picture's top-left corner white in a frame whose input had Scroll Lock down (tools/latency)
