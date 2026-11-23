@@ -1262,6 +1262,7 @@ static void DnProbeFromInputs(const uint32_t* in)	// the frame's inputs as the g
 	gProbeDown = d;
 }
 static int gFramesAhead = 0;
+int nDnPaceStretch = 0;	// frames still to start 1/8 frame late (--hold-smooth; run.cpp)
 static int gHeldFrames = 0, gStalledFrames = 0;	// since the last stats line: held for time sync / waiting on the peer's input
 static bool gEnding = false;
 static uint32_t gAutoRng = 0;
@@ -2028,7 +2029,9 @@ int DnNetGetInput()
 		gHeldFrames++;
 		sinceHold = 0;
 		DnFrameLog('h');
-		return 1;
+		// smooth hold (on unless --hold-smooth 0, owner 2026-11-23): the frame of advantage goes into the pacing instead (run.cpp RunPacePresent): the next 8 frames
+		// each start 1/8 of a frame later, so the picture never stops for a whole frame (33 ms between two drawn frames)
+		if (gArgs.holdSmooth) nDnPaceStretch += 8; else return 1;
 	}
 	sinceHold++;
 	if (gArgs.testStart && gCreditAddr) {

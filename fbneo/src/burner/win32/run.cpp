@@ -274,6 +274,7 @@ static bool RunPaceActive()
 	return true;
 }
 
+extern int nDnPaceStretch;	// dn_netplay.cpp: frames still to start 1/8 frame late (--hold-smooth)
 static void RunPacePresent()
 {
 	if (!RunPaceActive()) {
@@ -308,6 +309,9 @@ static void RunPacePresent()
 		nPaceNext = now.QuadPart + nPeriod;
 	}
 
+	// dn: a held frame spread over 8 (smooth hold): this frame starts 1/8 frame later. Added after the checks above, which
+	// would pull a schedule that far ahead back to now and so undo it (the first try did: the advantage was never paid)
+	if (nDnPaceStretch > 0) { nPaceNext += nPeriod / 8; nDnPaceStretch--; }
 	const LONGLONG nSleepMargin = qpcPaceFreq.QuadPart * 2 / 1000;
 	for (;;) {
 		QueryPerformanceCounter(&now);
