@@ -2021,6 +2021,10 @@ int DnNetGetInput()
 	if (gArgs.fastStart && !fastStarted) { fastStarted = true; DnFastStart(); }	// before GGPO saves its first frame
 	if (gArgs.replay) return DnReplayInput();
 	if (gArgs.watch) return DnWatchInput();
+	// late poll (on unless --poll-late 0, owner 2026-11-24): the network looked at again here, after the pacing wait (run.cpp RunPacePresent) and right before this
+	// frame's input. The once-a-loop look (DnNetIdle) comes before that wait, so a peer's input that arrived during it was
+	// guessed for this frame and rolled back on the next one: a rollback a frame deeper than the line needs.
+	if (gArgs.pollLate && gSession) { ggpo_idle(gSession, 0); if (gEnding) return 1; }
 	// GGPO says we're ahead of the peer by gFramesAhead frames: pay it back one held frame at a time, at least
 	// 10 frames apart. Holding them all in a row froze the picture for 50-70 ms (measured with tools/netsim.js).
 	static int sinceHold = 0;
@@ -2213,6 +2217,13 @@ void DnSetDelay(const std::string& line)
 	char j[64];
 	sprintf(j, "{\"ev\":\"delay\",\"frames\":%d,\"auto\":false}", d);
 	DnEmit(j);
+}
+
+// poll in the wait (on unless --poll-wait 0, owner 2026-11-24): called from the pacing wait (run.cpp RunPacePresent) about every millisecond: a peer's packets (inputs, and
+// the quality reports GGPO times the round trip with) are taken in as they come, not at the next once-a-loop look
+void DnNetPollWait()
+{
+	if (gSession && gArgs.pollWait && !gEnding) ggpo_idle(gSession, 0);
 }
 
 void DnNetIdle()

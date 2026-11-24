@@ -93,6 +93,8 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		else if (k == L"--balance") a.balance = wcscmp(v, L"1") == 0;
 		else if (k == L"--delay-trim") a.delayTrim = wcscmp(v, L"1") == 0;
 		else if (k == L"--hold-smooth") a.holdSmooth = wcscmp(v, L"1") == 0;
+		else if (k == L"--poll-late") a.pollLate = wcscmp(v, L"1") == 0;
+		else if (k == L"--poll-wait") a.pollWait = wcscmp(v, L"1") == 0;
 		else if (k == L"--vid-select") { ok = ParseUInt(v, 0, 5, u); a.vidSelect = (int)u; }
 		else if (k == L"--dwm-sync") { ok = ParseUInt(v, 0, 1, u); a.dwmSync = (int)u; }
 		else if (k == L"--aud-select") { ok = ParseUInt(v, 0, 2, u); a.audSelect = (int)u; }

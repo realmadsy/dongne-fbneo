@@ -274,7 +274,8 @@ static bool RunPaceActive()
 	return true;
 }
 
-extern int nDnPaceStretch;	// dn_netplay.cpp: frames still to start 1/8 frame late (--hold-smooth)
+extern int nDnPaceStretch;
+extern void DnNetPollWait();	// dn_netplay.cpp: --poll-wait	// dn_netplay.cpp: frames still to start 1/8 frame late (--hold-smooth)
 static void RunPacePresent()
 {
 	if (!RunPaceActive()) {
@@ -317,6 +318,7 @@ static void RunPacePresent()
 		QueryPerformanceCounter(&now);
 		LONGLONG nRemain = nPaceNext - now.QuadPart;
 		if (nRemain <= 0) break;
+		if (bDnNet) DnNetPollWait();
 		Sleep((bEnableHighResTimer && nRemain > nSleepMargin) ? 1 : 0);
 	}
 
