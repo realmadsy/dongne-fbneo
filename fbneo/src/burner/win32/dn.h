@@ -24,6 +24,7 @@ struct DnArgs {
 	int vidSelect = -1, dwmSync = -1, audSelect = -1, audSegs = -1;	// --aud-select / --aud-segs (tests): 0 DirectSound, 2 WASAPI; frames of buffer	// --vid-select / --dwm-sync (tests): the blitter (0 DDraw, 2 DDrawFX, 3 DX9, 4 DX9 Alt, 5 D3D11) and FBNeo's "sync to DWM", over the settings file
 	bool pollWait = true;	// the network looked at about every millisecond while the frame waits for its time (--poll-wait 0: not; owner 2026-11-24)
 	bool pollLate = true;	// the network looked at again right after the pacing wait, before the frame's input (--poll-late 0: not; owner 2026-11-24)
+	bool highPriority = true;	// the process at high priority, as Fightcade's emulator runs (--high-priority 0: normal; owner 2026-11-25)
 	bool holdSmooth = true;	// --hold-smooth 0 turns it off: a frame of advantage is paid back over 8 frames 1/8 longer each, not one frame skipped (owner 2026-11-23)
 	bool delayTrim = false;	// --delay-trim 1: the lobby's auto pick (from its probes) is lowered once if the game's own ping says less
 	bool balance = true;	// hold a frame when 2+ frames ahead of the peer, not only from 3 (GGPO): rollbacks split evenly (owner 2026-11-22: on); --balance 0 turns it off

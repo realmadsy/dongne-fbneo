@@ -275,6 +275,7 @@ static bool RunPaceActive()
 }
 
 extern int nDnPaceStretch;
+extern bool bDnSoundGap;	// aud_wasapi.cpp: this frame's sound is a filler (the game waited for the peer)
 extern void DnNetPollWait();	// dn_netplay.cpp: --poll-wait	// dn_netplay.cpp: frames still to start 1/8 frame late (--hold-smooth)
 static void RunPacePresent()
 {
@@ -369,6 +370,7 @@ int RunFrame(int bDraw, int bPause)
 					INT16 l = pBurnSoundOut[nBurnSoundLen * 2 - 2], r = pBurnSoundOut[nBurnSoundLen * 2 - 1];
 					for (INT32 i = 0; i < nBurnSoundLen; i++) { pBurnSoundOut[i * 2] = l; pBurnSoundOut[i * 2 + 1] = r; }	// hold the last sample instead
 				}
+				bDnSoundGap = true;					// WASAPI plays on through what's queued instead (aud_wasapi.cpp WasapiWriteSeg)
 				return 0;
 			}
 		}

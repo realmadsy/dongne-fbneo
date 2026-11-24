@@ -1362,6 +1362,9 @@ int DnP2PLoad()
 	bCheatsAllowed = false;
 	nCmdOptUsed = 2;		// like "-w": windowed, and no game-select dialog at startup
 	nVidFullscreen = 0;
+	// High priority, as Fightcade's emulator runs (its settings: nAppProcessPriority 128): the frame's wake-up and input read
+	// come first when the lobby or anything else wants the CPU too (owner 2026-11-25). Only the emulator; the lobby stays normal.
+	if (gArgs.highPriority) SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
 	// Sound: WASAPI with 4 frames of buffer (~67 ms) instead of DirectSound's 6 (~100 ms); hits are heard sooner.
 	// MediaInit() falls back to DirectSound if WASAPI can't start. Before the game loads: its sound chips are set up for
@@ -1581,7 +1584,8 @@ static void DnFastStart()
 // standard game file. Only practice writes to the game's memory, and it never runs in a match (no peer, no rollback).
 // Addresses found by recording every frame of a scripted fight and comparing.
 enum { PR_P1 = 0xFF83BE, PR_P2 = 0xFF86BE, PR_TIMER = 0xFF8ABE, PR_RAM = 0xFF0000 };
-enum { PR_STATE = 0x03, PR_X = 0x06, PR_HP = 0x2A, PR_HP_LATER = 0x2C, PR_HP_BAR = 0x1BD, PR_STUN_TIME = 0x5D, PR_STUN = 0x5F, PR_BALL = 0x1D4, PR_FIGHTER = 0x291, PR_PICKED = 0x2B5 };
+enum { PR_STATE = 0x03, PR_X = 0x06, PR_HP = 0x2A, PR_HP_LATER = 0x2C, PR_HP_BAR = 0x1BD, PR_STUN_TIME = 0x5D, PR_STUN = 0x5F, PR_BALL = 0x1D4, PR_FIGHTER = 0x291, PR_PICKED = 0x2B5,
+	PR_CROUCHED = 0x188 };	// CROUCHED: 2 for the whole of an attack started crouching, whatever the lever does after (measured)
 enum { ST_STAND = 0x00, ST_CROUCH = 0x02, ST_JUMP = 0x04, ST_BLOCK = 0x08, ST_ATTACK = 0x0A, ST_SPECIAL = 0x0C, ST_HURT = 0x0E, ST_THROWN = 0x14 };
 enum { MOVE_STAND, MOVE_FORWARD, MOVE_BACK, MOVE_JUMP_FORWARD, MOVE_JUMP_BACK, MOVE_JUMP, MOVE_CROUCH };
 enum { GUARD_OFF, GUARD_ON, GUARD_STEP, GUARD_REVERSAL };
@@ -1766,6 +1770,26 @@ void DnPracticeOverlay(UINT8* img, int w, int h, int bpp, int pitch)
 	}
 }
 
+// SF2 marks no attack low: its lows are the attack boxes that reach the ground (measured on every fighter's standing and crouching
+// normals: every low's box bottom 5 or under, every attack a standing guard blocks 20 or over). The box is read ahead in the fighter's
+// animation (records of 24 bytes: +12 the attack box, bit 7 of +2 the last record), so the guard is low before the first frame that hits.
+// 1 low, 0 not, -1 no attack box ahead (the recovery, or the attack's first frame, when the animation hasn't moved on to it yet).
+enum { PR_LOW_REACH = 12, PR_LOOKAHEAD = 16 };
+static int PrLowAttack(UINT32 base)
+{
+	const UINT32 tab = (UINT32)PrLong(base + PR_BOXTAB);
+	UINT32 a = (UINT32)PrLong(base + PR_ANIM);
+	for (int i = 0; i < PR_LOOKAHEAD; i++, a += 24) {
+		if (const int id = PrByte(a + 12)) {
+			const UINT32 e = tab + (UINT32)PrWord(tab + 4 * 2) + id * 12;
+			return (INT8)PrByte(e + 1) - PrByte(e + 3) < PR_LOW_REACH;
+		}
+		if (PrByte(a + 2) & 0x80) break;
+	}
+	return -1;
+}
+static int gPrLow = 0;	// the last attack box seen ahead was low: kept through the attack's recovery, so the dummy stays down in its block stun
+
 static uint32_t DnPracticeDummy()
 {
 	const int s1 = PrByte(PR_P1 + PR_STATE), s2 = PrByte(PR_P2 + PR_STATE), x1 = PrWord(PR_P1 + PR_X), x2 = PrWord(PR_P2 + PR_X);
@@ -1808,8 +1832,14 @@ static uint32_t DnPracticeDummy()
 		}
 	}
 
-	// Crouching guard blocks every ground attack and never walks off when the attack is still out of reach; a jump-in needs a standing one.
-	if ((gPrGuard == GUARD_ON || (gPrGuard == GUARD_STEP && gPrStep == 1)) && threat) return back | (s1 == ST_JUMP ? 0 : R_DOWN);
+	// The guard follows the attack (owner 2026-11-24): a crouching attack or a low is blocked crouching, everything else standing; a
+	// crouching dummy keeps crouching on the ground. A jump-in always needs a standing guard. Holding back standing doesn't walk off: the
+	// game puts the fighter in its guard as soon as an attack is out near it (measured: 0 px walked, attacks near and out of reach, a fireball).
+	const bool attacking = s1 == ST_ATTACK || s1 == ST_SPECIAL;
+	const int ahead = attacking ? PrLowAttack(PR_P1) : 0;
+	if (ahead >= 0) gPrLow = ahead;
+	const bool low = attacking && (PrByte(PR_P1 + PR_CROUCHED) || gPrLow);
+	if ((gPrGuard == GUARD_ON || (gPrGuard == GUARD_STEP && gPrStep == 1)) && threat) return back | (s1 != ST_JUMP && (low || gPrMove == MOVE_CROUCH) ? R_DOWN : 0);
 	switch (gPrMove) {
 		case MOVE_FORWARD: return forward;
 		case MOVE_BACK: return back;

@@ -450,18 +450,98 @@ static int WasapiBlankSound()
 	return 0;
 }
 
-// Write the seg in nAudNextSound to the device
-static HRESULT WasapiWriteSeg()
+// dn: the buffer kept topped up (owner 2026-11-25). Netplay runs each frame on its own steady schedule (run.cpp
+// RunPacePresent), so the sound is made exactly at the game's pace and nothing refilled what the card's own clock or a
+// smoothed hold (8 frames 1/8 late) took: the buffer ran down to ~10 ms before each write and now and then out - a tear
+// (measured, tools/netsim.js: 4 and 11 times in 105 s). Each frame's sound is now stretched or squeezed by at most 0.5%
+// (a pitch change nobody hears) to keep about two frames queued before each write. The game's frames, input and picture
+// are untouched: only how many samples a frame's sound becomes.
+// A frame the game didn't play (waiting for the peer: run.cpp fills it with the last sample held) writes nothing while
+// there's enough queued, and the rate control makes it up; else it fades to silence and the next frame fades in, no click.
+extern bool bDnNet;
+bool bDnSoundGap = false;	// run.cpp: this frame's sound is a filler, the game waited
+enum { DRC_FADE = 256 };	// samples (5 ms) to fade out to silence or in from it
+static INT16* pDrcOut = NULL;
+static INT32 nDrcOutMax = 0;
+static double dDrcLevel = -1.0, dDrcFrac = 0.0;
+static bool bDrcFadeIn = false;
+
+static HRESULT WasapiWriteFrames(const INT16* pSrc, INT32 nFrames)
 {
 	BYTE* pData = NULL;
-	HRESULT hr = pRenderClient->GetBuffer(nAudSegLen, &pData);
+	HRESULT hr = pRenderClient->GetBuffer(nFrames, &pData);
 	if (FAILED(hr)) {
 		return hr;
 	}
 
-	WasapiConvert(pData, nAudNextSound, nAudSegLen);
+	WasapiConvert(pData, pSrc, nFrames);
 
-	return pRenderClient->ReleaseBuffer(nAudSegLen, 0);
+	return pRenderClient->ReleaseBuffer(nFrames, 0);
+}
+
+// Write the seg in nAudNextSound to the device
+static HRESULT WasapiWriteSeg()
+{
+	if (!bDnNet) {
+		return WasapiWriteFrames(nAudNextSound, nAudSegLen);
+	}
+
+	UINT32 nPadding = 0;
+	if (FAILED(pAudioClient->GetCurrentPadding(&nPadding))) {
+		nPadding = nAudSegLen * 2;
+	}
+	dDrcLevel = dDrcLevel < 0 ? nPadding : dDrcLevel + (nPadding - dDrcLevel) * 0.05;	// smoothed: the reading moves in the card's ~10 ms steps
+
+	if (bDnSoundGap) {
+		bDnSoundGap = false;
+		if (nPadding > (UINT32)nAudSegLen * 3 / 2) {
+			return S_OK;
+		}
+		for (INT32 i = 0; i < nAudSegLen; i++) {	// the held sample, down to silence
+			const INT32 g = i < DRC_FADE ? DRC_FADE - i : 0;
+			nAudNextSound[i * 2 + 0] = (INT16)(nAudNextSound[i * 2 + 0] * g / DRC_FADE);
+			nAudNextSound[i * 2 + 1] = (INT16)(nAudNextSound[i * 2 + 1] * g / DRC_FADE);
+		}
+		bDrcFadeIn = true;
+		return WasapiWriteFrames(nAudNextSound, nAudSegLen);
+	}
+
+	double dRatio = 1.0 + 0.005 * (nAudSegLen * 2.0 - dDrcLevel) / nAudSegLen;
+	if (dRatio > 1.005) dRatio = 1.005;
+	if (dRatio < 0.995) dRatio = 0.995;
+	const double dWant = nAudSegLen * dRatio + dDrcFrac;
+	INT32 nOut = (INT32)dWant;
+	dDrcFrac = dWant - nOut;
+	if (nOut > (INT32)(nBufferFrames - nPadding)) nOut = (INT32)(nBufferFrames - nPadding);	// never more than fits
+	if (nOut < 1) return S_OK;
+
+	if (nDrcOutMax < nOut) {
+		free(pDrcOut);
+		nDrcOutMax = nAudSegLen * 2;
+		pDrcOut = (INT16*)malloc(nDrcOutMax * 2 * sizeof(INT16));
+		if (pDrcOut == NULL) {
+			nDrcOutMax = 0;
+			return WasapiWriteFrames(nAudNextSound, nAudSegLen);
+		}
+	}
+	for (INT32 j = 0; j < nOut; j++) {	// linear, first and last samples kept, so frames still join where they met
+		const double x = nOut > 1 ? (double)j * (nAudSegLen - 1) / (nOut - 1) : 0.0;
+		const INT32 i = (INT32)x;
+		const INT32 i1 = i + 1 < nAudSegLen ? i + 1 : i;
+		const double f = x - i;
+		for (int c = 0; c < 2; c++) {
+			pDrcOut[j * 2 + c] = (INT16)(nAudNextSound[i * 2 + c] + (nAudNextSound[i1 * 2 + c] - nAudNextSound[i * 2 + c]) * f);
+		}
+	}
+	if (bDrcFadeIn) {
+		bDrcFadeIn = false;
+		for (INT32 j = 0; j < nOut && j < DRC_FADE; j++) {
+			pDrcOut[j * 2 + 0] = (INT16)(pDrcOut[j * 2 + 0] * j / DRC_FADE);
+			pDrcOut[j * 2 + 1] = (INT16)(pDrcOut[j * 2 + 1] * j / DRC_FADE);
+		}
+	}
+
+	return WasapiWriteFrames(pDrcOut, nOut);
 }
 
 // Called continuously by the run loop: blocks until there's room for at least one
