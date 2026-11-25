@@ -580,8 +580,14 @@ static bool __cdecl cbSave(unsigned char** buffer, int* len, int* checksum, int)
 	return true;
 }
 
+// Rollbacks since the last stats line: GGPO loads a state once per rollback (2026-11-25, owner: to set beside Fightcade's
+// "Rollback Nf", which is re-simulated frames over rollbacks; docs/latency.md). A replay seek or a spectator's catch-up
+// load counts too, but those run without a session, so no stats line carries them.
+static int gRollbacks = 0;
+
 static bool __cdecl cbLoad(unsigned char* buffer, int)
 {
+	gRollbacks++;
 	memcpy(&nCurrentFrame, buffer, sizeof(UINT32));
 	memcpy(gSeat, buffer + sizeof(UINT32), sizeof(gSeat));
 	gScanPtr = buffer + sizeof(UINT32) + sizeof(gSeat);
@@ -2274,12 +2280,12 @@ void DnNetIdle()
 		if (st.network.ping > worstPing) worstPing = st.network.ping;
 		const int ahead = st.timesync.remote_frames_behind - st.timesync.local_frames_behind;
 		if (ahead > worstAhead) worstAhead = ahead;
-		char j[192];
-		sprintf(j, "{\"ev\":\"stats\",\"player\":%d,\"ping\":%d,\"framesAhead\":%d,\"rollbackFrames\":%d,\"held\":%d,\"stalled\":%d,\"frame\":%d,\"kbps\":%d}",
-			p + 1, st.network.ping, st.timesync.remote_frames_behind, gRollbackFrames, gHeldFrames, gStalledFrames, gFrame, st.network.kbps_sent);
+		char j[256];
+		sprintf(j, "{\"ev\":\"stats\",\"player\":%d,\"ping\":%d,\"framesAhead\":%d,\"rollbackFrames\":%d,\"rollbacks\":%d,\"held\":%d,\"stalled\":%d,\"frame\":%d,\"kbps\":%d}",
+			p + 1, st.network.ping, st.timesync.remote_frames_behind, gRollbackFrames, gRollbacks, gHeldFrames, gStalledFrames, gFrame, st.network.kbps_sent);
 		DnEmit(j);
 	}
-	gRollbackFrames = 0;
+	gRollbackFrames = gRollbacks = 0;
 	gHeldFrames = gStalledFrames = 0;
 	// balance (on unless --balance 0; owner 2026-11-22): GGPO holds the side ahead only from 3 frames (MIN_FRAME_ADVANTAGE), so a side 1-2
 	// frames ahead keeps it and takes most of the rollbacks. Over 4 seconds' samples: a frame or more ahead, one frame
