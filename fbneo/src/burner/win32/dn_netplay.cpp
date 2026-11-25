@@ -742,6 +742,8 @@ static std::vector<uint32_t> gFeed;		// a spectator: frame gFeedBase + i at [i *
 static int gFeedBase = -1;
 static std::vector<std::pair<int, uint32_t> > gFeedHash;
 static bool gWatchPlaying = false, gWatchDrift = false;
+static int gWatchWait = 0, gWatchPauses = 0, gWatchSkip = 0, gWatchPlayed = 0, gWatchRun = 0;	// the sound check (DnSoundCheck): frames waited, pauses, frames jumped
+static bool gWatchPaused = false;
 static int gFeedEnd = -1;	// where the players' feed ends on the server now (the live match); -1: an older server, not told
 static int gWatchChecked = 0;
 
@@ -999,9 +1001,15 @@ static int DnWatchInput()
 		started = true;
 		if (f != gFeedBase) { gWatchDrift = true; DnEmitError("watch_start", "the feed starts on another frame than this game"); }
 	}
-	if (!gWatchPlaying && ahead < 30) { DnWatchBehind(gFeedEnd - f, f); return 1; }
-	if (ahead <= 0) { gWatchPlaying = false; DnWatchBehind(gFeedEnd - f, f); return 1; }
-	if (!gWatchPlaying) { gWatchPlaying = true; DnEmit("{\"ev\":\"watch-playing\"}"); }
+	// the sound check: a pause counts once it plays on within 5 s (longer: the match is over, waiting for the next is no fault)
+	if (!gWatchPlaying && ahead < 30) { if (gWatchPaused) gWatchRun++; DnWatchBehind(gFeedEnd - f, f); return 1; }
+	if (ahead <= 0) { gWatchPlaying = false; gWatchPaused = true; gWatchRun = 1; DnWatchBehind(gFeedEnd - f, f); return 1; }
+	if (!gWatchPlaying) {
+		gWatchPlaying = true;
+		DnEmit("{\"ev\":\"watch-playing\"}");
+		if (gWatchPaused && gWatchRun <= 300) { gWatchPauses++; gWatchWait += gWatchRun; }
+		gWatchPaused = false;
+	}
 	if (ahead > 120) {	// unseen, as fast as it goes: half a minute of match a tick at most, so the lobby's lines still come in
 		int n = 0;
 		for (; ahead > 60 && n < 1800; n++, ahead--) {
@@ -1009,6 +1017,7 @@ static int DnWatchInput()
 			DnStepFrame(false);
 			gFrame++;
 		}
+		if (gWatchPlayed >= 300) gWatchSkip += n;	// the sound check: a jump once watching, not the catch-up of coming in late
 		if (gFeedEnd < 0) {	// an older server: the lobby only hears how much of what it has is left
 			char j[64];
 			sprintf(j, "{\"ev\":\"watch-catchup\",\"behind\":%d}", ahead);
@@ -1019,6 +1028,7 @@ static int DnWatchInput()
 	DnWatchApply();
 	DnEmitSeats();	// who holds which player number (after a seat swap the room's order and the players' differ)
 	if (gFrame % 4 == 0) DnEmitWatchInputs();
+	gWatchPlayed++;
 	return 0;
 }
 
@@ -2262,9 +2272,43 @@ void DnNetPollWait()
 	if (gSession && gArgs.pollWait && !gEnding) ggpo_idle(gSession, 0);
 }
 
+// The sound check (owner 2026-11-25: music breaking was reported and nothing showed on the dev PC): once a second, in every
+// mode (a match, alone, watching), what the sound card side did (aud_wasapi.cpp DnAudioTake: the buffer empty or low, a
+// waited frame faded, a frame squeezed) and, watching, the frames waited for the feed, the pauses and the frames jumped to
+// catch up. Only a second that had any goes to the lobby ({"ev":"aud"}: the match log, and summed into the problem log's
+// summary); the first 10 s are left out (the start waits for the peer or the feed by design). Once: which output plays.
+extern void DnAudioTake(int* pEmpty, int* pLow, int* pFade, int* pSqueeze);
+extern bool DnAudioInfo(UINT32* pBuffer, UINT32* pTarget);
+static void DnSoundCheck()
+{
+	static DWORD last = 0;
+	static bool told = false;
+	if (!told && bAudOkay) {
+		told = true;
+		UINT32 buf = 0, target = 0;
+		const bool wasapi = DnAudioInfo(&buf, &target);
+		char j[96];
+		sprintf(j, "{\"ev\":\"aud-out\",\"out\":\"%s\",\"buf\":%u,\"target\":%u}", wasapi ? "wasapi" : "other", buf, target);
+		DnEmit(j);
+	}
+	const DWORD now = GetTickCount();
+	if (now - last < 1000) return;
+	last = now;
+	int empty, low, fade, squeeze;
+	DnAudioTake(&empty, &low, &fade, &squeeze);
+	if (gFrame < 600) { gWatchWait = gWatchPauses = gWatchSkip = 0; return; }
+	if (!(empty | low | fade | squeeze | gWatchWait | gWatchPauses | gWatchSkip)) return;
+	char j[192];
+	sprintf(j, "{\"ev\":\"aud\",\"empty\":%d,\"low\":%d,\"fade\":%d,\"squeeze\":%d,\"wait\":%d,\"pause\":%d,\"skip\":%d,\"frame\":%d}",
+		empty, low, fade, squeeze, gWatchWait, gWatchPauses, gWatchSkip, gFrame);
+	gWatchWait = gWatchPauses = gWatchSkip = 0;
+	DnEmit(j);
+}
+
 void DnNetIdle()
 {
 	if (DnIpcPoll()) DnEnd("quit");
+	DnSoundCheck();
 	if (!gSession) return;
 	ggpo_idle(gSession, 0);
 

@@ -460,6 +460,23 @@ static int WasapiBlankSound()
 // there's enough queued, and the rate control makes it up; else it fades to silence and the next frame fades in, no click.
 extern bool bDnNet;
 bool bDnSoundGap = false;	// run.cpp: this frame's sound is a filler, the game waited
+
+// dn: the sound check (owner 2026-11-25: music breaking reported, nothing showed on the dev PC): what each write found and
+// did - the buffer empty (the card played silence before it: a tear) or under ~10 ms, a waited frame faded to silence, a
+// frame squeezed into the little room left. Integer adds on a write that has read the padding already; dn_netplay.cpp
+// takes and clears them once a second (DnAudioTake) and tells the lobby only a second that had any.
+static int nDnAudEmpty = 0, nDnAudLow = 0, nDnAudFade = 0, nDnAudSqueeze = 0;
+void DnAudioTake(int* pEmpty, int* pLow, int* pFade, int* pSqueeze)
+{
+	*pEmpty = nDnAudEmpty; *pLow = nDnAudLow; *pFade = nDnAudFade; *pSqueeze = nDnAudSqueeze;
+	nDnAudEmpty = nDnAudLow = nDnAudFade = nDnAudSqueeze = 0;
+}
+// which output plays (DirectSound when WASAPI couldn't start: none of the above is counted then) and its buffer, in samples
+bool DnAudioInfo(UINT32* pBuffer, UINT32* pTarget)
+{
+	*pBuffer = nBufferFrames; *pTarget = nTargetFrames;
+	return pAudioClient != NULL;
+}
 enum { DRC_FADE = 256 };	// samples (5 ms) to fade out to silence or in from it
 static INT16* pDrcOut = NULL;
 static INT32 nDrcOutMax = 0;
@@ -491,12 +508,12 @@ static HRESULT WasapiWriteSeg()
 		nPadding = nAudSegLen * 2;
 	}
 	dDrcLevel = dDrcLevel < 0 ? nPadding : dDrcLevel + (nPadding - dDrcLevel) * 0.05;	// smoothed: the reading moves in the card's ~10 ms steps
-
 	if (bDnSoundGap) {
 		bDnSoundGap = false;
 		if (nPadding > (UINT32)nAudSegLen * 3 / 2) {
 			return S_OK;
 		}
+		if (!bDrcFadeIn) nDnAudFade++;	// the sound check: once a break, however many frames it waits
 		for (INT32 i = 0; i < nAudSegLen; i++) {	// the held sample, down to silence
 			const INT32 g = i < DRC_FADE ? DRC_FADE - i : 0;
 			nAudNextSound[i * 2 + 0] = (INT16)(nAudNextSound[i * 2 + 0] * g / DRC_FADE);
@@ -506,13 +523,16 @@ static HRESULT WasapiWriteSeg()
 		return WasapiWriteFrames(nAudNextSound, nAudSegLen);
 	}
 
+	if (nPadding == 0) nDnAudEmpty++;	// the sound check: while it plays (a wait's own run-down is the fade above)
+	else if (nPadding < (UINT32)nAudSegLen * 3 / 5) nDnAudLow++;
+
 	double dRatio = 1.0 + 0.005 * (nAudSegLen * 2.0 - dDrcLevel) / nAudSegLen;
 	if (dRatio > 1.005) dRatio = 1.005;
 	if (dRatio < 0.995) dRatio = 0.995;
 	const double dWant = nAudSegLen * dRatio + dDrcFrac;
 	INT32 nOut = (INT32)dWant;
 	dDrcFrac = dWant - nOut;
-	if (nOut > (INT32)(nBufferFrames - nPadding)) nOut = (INT32)(nBufferFrames - nPadding);	// never more than fits
+	if (nOut > (INT32)(nBufferFrames - nPadding)) { nOut = (INT32)(nBufferFrames - nPadding); nDnAudSqueeze++; }	// never more than fits
 	if (nOut < 1) return S_OK;
 
 	if (nDrcOutMax < nOut) {
