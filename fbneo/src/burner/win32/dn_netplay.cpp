@@ -1882,12 +1882,18 @@ static void DnPracticeHealth(UINT32 base, int hp)
 	WriteValueAtHardwareAddress(base + PR_HP_LATER, hp, 2, 0);
 }
 
+enum { PR_REACTION = 0x4B, RE_STAND_BLOCK = 6, RE_CROUCH_BLOCK = 8 };
 static void DnPracticeBody()
 {
 	const int s1 = PrByte(PR_P1 + PR_STATE), s2 = PrByte(PR_P2 + PR_STATE), hp1 = PrWord(PR_P1 + PR_HP), hp2 = PrWord(PR_P2 + PR_HP);
 	if (hp2 == 0) return;		// no fight yet: the game sets health up when the round starts
 	if (gPrWrites & WRITE_TIME) WriteValueAtHardwareAddress(PR_TIMER, 0x99, 1, 0);
-	if (hp2 < gPrLastHp && s2 != ST_BLOCK) {
+	// A blocked special's chip lands as block stun starts, state 14 as a hit's. The reaction the game chose tells them apart (measured on
+	// all 12 fighters): 6 or 8 for a block, never for a hit. Only in state 14: it is never cleared, and a throw doesn't set it (its health
+	// falls in state 20, or 0 for a hold), so it can still hold the last block's 6 when a throw lands.
+	const int reaction = PrByte(PR_P2 + PR_REACTION);
+	const bool blocked = s2 == ST_BLOCK || (s2 == ST_HURT && (reaction == RE_STAND_BLOCK || reaction == RE_CROUCH_BLOCK));
+	if (hp2 < gPrLastHp && !blocked) {
 		gPrHits++;
 		gPrDamage += gPrLastHp - hp2;
 		char j[64];
