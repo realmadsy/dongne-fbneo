@@ -460,6 +460,11 @@ static int WasapiBlankSound()
 // there's enough queued, and the rate control makes it up; else it fades to silence and the next frame fades in, no click.
 extern bool bDnNet;
 bool bDnSoundGap = false;	// run.cpp: this frame's sound is a filler, the game waited
+// dn_netplay.cpp: a spectator jumped frames to catch up (2026-11-26: heard as a break while watching): the sound already
+// queued ends where it ended and this frame's starts somewhere else. The last sample written fades to silence and this
+// frame fades in, as after a wait, instead of the two meeting in a click. Players' frames never set it.
+bool bDnSoundJump = false;
+static INT16 nDrcLastL = 0, nDrcLastR = 0;	// the last sample written, for that fade
 
 // dn: the sound check (owner 2026-11-25: music breaking reported, nothing showed on the dev PC): what each write found and
 // did - the buffer empty (the card played silence before it: a tear) or under ~10 ms, a waited frame faded to silence, a
@@ -523,6 +528,19 @@ static HRESULT WasapiWriteSeg()
 		return WasapiWriteFrames(nAudNextSound, nAudSegLen);
 	}
 
+	if (bDnSoundJump) {
+		bDnSoundJump = false;
+		if (!bDrcFadeIn && nBufferFrames - nPadding > (UINT32)DRC_FADE * 2) {	// a wait's fade already went to silence: nothing to fade
+			INT16 tail[DRC_FADE * 2];
+			for (INT32 i = 0; i < DRC_FADE; i++) {
+				tail[i * 2 + 0] = (INT16)(nDrcLastL * (DRC_FADE - i) / DRC_FADE);
+				tail[i * 2 + 1] = (INT16)(nDrcLastR * (DRC_FADE - i) / DRC_FADE);
+			}
+			if (SUCCEEDED(WasapiWriteFrames(tail, DRC_FADE))) nPadding += DRC_FADE;
+		}
+		bDrcFadeIn = true;
+	}
+
 	if (nPadding == 0) nDnAudEmpty++;	// the sound check: while it plays (a wait's own run-down is the fade above)
 	else if (nPadding < (UINT32)nAudSegLen * 3 / 5) nDnAudLow++;
 
@@ -560,6 +578,7 @@ static HRESULT WasapiWriteSeg()
 			pDrcOut[j * 2 + 1] = (INT16)(pDrcOut[j * 2 + 1] * j / DRC_FADE);
 		}
 	}
+	nDrcLastL = pDrcOut[nOut * 2 - 2]; nDrcLastR = pDrcOut[nOut * 2 - 1];
 
 	return WasapiWriteFrames(pDrcOut, nOut);
 }

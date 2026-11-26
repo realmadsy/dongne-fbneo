@@ -743,6 +743,7 @@ static int gFeedBase = -1;
 static std::vector<std::pair<int, uint32_t> > gFeedHash;
 static bool gWatchPlaying = false, gWatchDrift = false;
 static int gWatchWait = 0, gWatchPauses = 0, gWatchSkip = 0, gWatchPlayed = 0, gWatchRun = 0;	// the sound check (DnSoundCheck): frames waited, pauses, frames jumped
+extern bool bDnSoundJump;	// aud_wasapi.cpp: a jump's sound fades out and in
 static bool gWatchPaused = false;
 static int gFeedEnd = -1;	// where the players' feed ends on the server now (the live match); -1: an older server, not told
 static int gWatchChecked = 0;
@@ -1018,6 +1019,7 @@ static int DnWatchInput()
 			gFrame++;
 		}
 		if (gWatchPlayed >= 300) gWatchSkip += n;	// the sound check: a jump once watching, not the catch-up of coming in late
+		if (n) bDnSoundJump = true;	// aud_wasapi.cpp: what was playing fades out and this frame's sound fades in, no click
 		if (gFeedEnd < 0) {	// an older server: the lobby only hears how much of what it has is left
 			char j[64];
 			sprintf(j, "{\"ev\":\"watch-catchup\",\"behind\":%d}", ahead);

@@ -26,8 +26,10 @@ UdpProtocol::UdpProtocol() :
    _queue(-1),
    _magic_number(0),
    _remote_magic_number(0),
+   _round_trip_time(0),   // dn: was left unset until the first quality reply; the first second's stats sent that memory as the ping (2026-11-26: 511185723)
    _packets_sent(0),
    _bytes_sent(0),
+   _kbps_sent(0),
    _stats_start_time(0),
    _last_send_time(0),
    _shutdown_timeout(0),
@@ -357,6 +359,9 @@ UdpProtocol::UpdateNetworkStats(void)
       _stats_start_time = now;
    }
 
+   if (now == _stats_start_time) {
+      return;   // dn: the first call, no time gone yet: the rate was bytes / 0, int(inf) = -2147483648 kbps
+   }
    int total_bytes_sent = _bytes_sent + (UDP_HEADER_SIZE * _packets_sent);
    float seconds = (float)((now - _stats_start_time) / 1000.0);
    float Bps = total_bytes_sent / seconds;
