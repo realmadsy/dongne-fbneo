@@ -19,6 +19,7 @@ class Peer2PeerBackend : public IQuarkBackend, IPollSink, Udp::Callbacks {
 public:
    Peer2PeerBackend(GGPOSessionCallbacks *cb, const char *gamename, uint16 localport, int num_players, int input_size);
    virtual ~Peer2PeerBackend();
+   bool Bound() const { return _udp.Bound(); }   // dn
 
 
 public:

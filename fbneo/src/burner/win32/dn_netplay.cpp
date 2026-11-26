@@ -1401,19 +1401,17 @@ int DnP2PLoad()
 	gAlone = gPlayers == 1 || gArgs.practice || gArgs.watch;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
 	if (gArgs.practice) DnSetPractice(gArgs.practiceSet);
 	if (!gAlone) {
+		// The port, up to 2 s: held only a moment (before the game starts, so no lag). GGPO's own bind can lose it after the look
+		// too: its session then fails (it never sent or heard a packet and waited for its peer forever, 2026-11-25), so that waits
+		// the same way. Starting the session is its only failure.
+		GGPOSessionCallbacks cb = DnCallbacks();
 		int portTries = 0;
-		while (!DnPortFree(gArgs.localPort) && ++portTries < 40) Sleep(50);	// up to 2 s: held only a moment (before the game starts, so no lag)
+		bool started = false;
+		while (!(started = DnPortFree(gArgs.localPort) && GGPO_SUCCEEDED(ggpo_start_session(&gSession, &cb, (char*)"dongne", gPlayers, sizeof(uint32_t), gArgs.localPort))) && ++portTries < 40) Sleep(50);
 		if (portTries) { char j[96]; sprintf(j, "{\"ev\":\"port-wait\",\"tries\":%d}", portTries); DnEmit(j); }	// for the match log
-		if (portTries >= 40) {
+		if (!started) {
 			DnEmitError("port_in_use", ("udp port " + std::to_string(gArgs.localPort)).c_str());
 			gExitCode = DN_EXIT_PORT;
-			return 1;
-		}
-
-		GGPOSessionCallbacks cb = DnCallbacks();
-		if (!GGPO_SUCCEEDED(ggpo_start_session(&gSession, &cb, (char*)"dongne", gPlayers, sizeof(uint32_t), gArgs.localPort))) {
-			DnEmitError("ggpo_failed", "ggpo_start_session");
-			gExitCode = DN_EXIT_OTHER;
 			return 1;
 		}
 		ggpo_set_disconnect_timeout(gSession, 3000);

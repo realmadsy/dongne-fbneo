@@ -43,11 +43,14 @@ ggpo_start_session(GGPOSession **session,
                    int input_size,
                    unsigned short localport)
 {
-   *session= (GGPOSession *)new Peer2PeerBackend(cb,
-                                                 game,
-                                                 localport,
-                                                 num_players,
-                                                 input_size);
+   Peer2PeerBackend *p2p = new Peer2PeerBackend(cb, game, localport, num_players, input_size);
+   // dn: its UDP port not bound (taken a moment before): it never sent or heard a packet and waited for its peer forever
+   if (!p2p->Bound()) {
+      delete p2p;
+      *session = NULL;
+      return GGPO_ERRORCODE_GENERAL_FAILURE;
+   }
+   *session = (GGPOSession *)p2p;
    return GGPO_OK;
 }
 

@@ -39,6 +39,7 @@ public:
    Udp();
 
    void Init(uint16 port, Poll *p, Callbacks *callbacks);
+   bool Bound() const { return _socket != INVALID_SOCKET; }   // dn: Init took its port
    
    void SendTo(char *buffer, int len, int flags, struct sockaddr *dst, int destlen);
 
