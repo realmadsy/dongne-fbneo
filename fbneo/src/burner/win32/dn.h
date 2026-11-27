@@ -35,7 +35,7 @@ struct DnArgs {
 	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
 	std::vector<int> seats;	// --seats 2,1: the player number of each room player (room order) to start with; default 1, 2, ...
 	bool runAhead = false;		// --runahead 1: show the frame after the real one (this player's screen only)
-	bool romTextFix = true;	// --rom-text-fix 0: a driver's fixes to a game's on-screen text left off (a replay recorded before them: its state checks still match)
+	int romTextFix = 2;	// --rom-text-fix N: a driver's fixes to a game's on-screen text up to level N only (a replay recorded before the later ones: its state checks still match); 1 the 3:3 ORDER SELECT, 2 its bosses' world names
 	bool seatRestart = false;	// --seat-restart 1: a fighting game: seats never swap in play, an agreed swap is reported to restart with
 	bool freeCoin = false;	// --free-coin 1: the coin key works and start is only start (tools/latency.ps1 times the coin key)
 	unsigned int seed = 1;
