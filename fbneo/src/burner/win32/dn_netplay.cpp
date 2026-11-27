@@ -439,6 +439,7 @@ void DnSetHotkeys(const std::string& line)
 // ---------------------------------------------------------------- state
 
 int nDnNetplay = 0;	// scrn.cpp is_netgame_or_recording: a net game from the driver's start (DnStart)
+bool bDnRomTextFix = true;	// a driver may fix a typo in a game's on-screen text at init; off for a replay recorded before (--rom-text-fix 0)
 static UINT8* gScanPtr = NULL;
 static INT32 gScanLen = 0;
 
@@ -1215,6 +1216,7 @@ static int DnLoadGame(const DnArgs& a)
 	// fixed ones on every PC, players, spectators and the lone game alike. kNetGame comes later (it would call Kaillera in
 	// DrvInit), so before this a spectator's ssriders/wofj seeded from the time and its state hash told a drift at frame 300.
 	nDnNetplay = 1;
+	bDnRomTextFix = a.romTextFix;	// read by a driver's init (--rom-text-fix 0: an older replay)
 	if (DrvInit(nGame, false) || !bDrvOkay) {
 		DnEmitError("rom_missing", ("cannot load " + a.game).c_str());
 		return DN_EXIT_ROM;
