@@ -276,6 +276,7 @@ bool DnIpcPoll()
 		if (l.find("\"cmd\":\"keymap\"") != std::string::npos) DnSetKeymap(l);
 		if (l.find("\"cmd\":\"hotkeys\"") != std::string::npos) DnSetHotkeys(l);
 		if (l.find("\"cmd\":\"practice\"") != std::string::npos) DnSetPractice(l);
+		if (l.find("\"cmd\":\"mission\"") != std::string::npos) DnMissionCmd(l);
 		if (l.find("\"cmd\":\"seat\"") != std::string::npos) DnSetSeat(l);
 		if (l.find("\"cmd\":\"delay\"") != std::string::npos) DnSetDelay(l);
 		if (l.find("\"cmd\":\"volume\"") != std::string::npos) DnSetVolume(l);

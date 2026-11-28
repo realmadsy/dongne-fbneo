@@ -1247,6 +1247,7 @@ static int DnLoadGame(const DnArgs& a)
 }
 
 static int DnPracticeTest(const DnArgs& a);
+static void DnMissionOpen(const std::wstring& path, int demo);
 
 int DnRun(const DnArgs& a)
 {
@@ -1433,6 +1434,7 @@ int DnP2PLoad()
 	if ((gExitCode = DnLoadGame(gArgs)) != 0) return 1;
 
 	gAlone = gPlayers == 1 || gArgs.practice || gArgs.watch;		// alone in a room, or practising: no peer and no rollback, so no GGPO (it can't run a session of one)
+	if (gArgs.practice && gArgs.game == "sf2ce" && !gArgs.mission.empty()) DnMissionOpen(gArgs.mission, gArgs.demo);	// before the settings: a mission keeps its own
 	if (gArgs.practice) DnSetPractice(gArgs.practiceSet);
 	if (!gAlone) {
 		// The port, up to 2 s: held only a moment (before the game starts, so no lag). GGPO's own bind can lose it after the look
@@ -1665,9 +1667,57 @@ static int gPrTestHp = 0;	// tests: what the dummy's health is refilled to, inst
 // 1 STEP: 0 = waiting for the first hit, 1 = it landed; back to 0 once the fighter has been free for PR_QUIET frames.
 static int gPrStep = 0, gPrQuiet = 0, gPrFired = 0;
 static int gPrHits = 0, gPrDamage = 0, gPrLastHp = PR_FULL, gPrLastHp1 = PR_FULL, gPrSettle[2] = { 0, 0 }, gPrCalm[2] = { 0, 0 };
+static int gPrHitCount = 0;	// every hit since the start, never cleared: gPrHits goes back to 0 on the frame a fireball lands (the fighter reacts frames later)
 static bool gPrReported = false;
 
+// A mission (dn_netplay.cpp "missions" below): while one is on, its own settings are the dummy's, so the panel's are not taken.
+struct DnMisGoal {
+	int kind = 0, hits = 0, dizzy = 0, timeout = 600, dxMin = 0, dxMax = 0x7FFF;	// kind 0 combo, 1 play
+	std::vector<std::vector<int> > moves;	// combo: one entry a hit, the moves taken for it; play: one entry
+	std::vector<int> states;				// play: the dummy's states it may be hit in
+};
+struct DnMission {
+	bool on = false, ready = false, resetPending = false;
+	std::vector<std::pair<int, std::string> > sets;	// frame, a practice command applied then
+	std::vector<std::pair<int, int> > ins;			// frame, the roles held from then on
+	int start = 0, end = 0;
+	uint32_t hash = 0;
+	DnMisGoal goal;
+	std::vector<UINT8> s0;	// the start state (cbSave's bytes)
+	int t = 0;				// the attempt's frame
+	// the attempt so far (DnMissionJudge): hits seen (of gPrHitCount), hits, frames left to show the result, the dummy's last state
+	// before it was hit, whether it went dizzy, and while a hit has not yet made it reel (a fireball takes health frames before)
+	int seen = 0, hits = 0, hold = 0, sinceHit = 0, lastFree = 0;
+	bool ended = false, waitHurt = false, dizzySeen = false, startHeld = false;
+	bool demo = false;		// the model plays instead of the player (spec §5: once on opening, and on 모범답안 보기)
+	bool demoDone = false;	// the model's own run has ended: the next reset is the player's turn
+	int speed = 10, tick = 0;	// tenths, as a replay's (2, 5, 10)
+	size_t leadSet = 0, leadIn = 0;	// the lead-in, run over several ticks: where it has got to
+	int leadRoles = 0;
+};
+static DnMission gMis;
+
+// A recording in practice (spec §7: how a mission is made): the settings and presses since the fast start are all kept, so a mark
+// can come at any time and what came before it is the mission's lead-in. From the mark to the save the dummy's settings stay.
+struct DnPrHit { int t, move, state, dx, stun; };
+struct DnPrRec {
+	std::vector<std::pair<int, std::string> > sets;
+	std::vector<std::pair<int, int> > ins;
+	int lastRoles = -1, start = -1, end = -1, seen = 0, lastFree = 0, since = 0;
+	bool busy = false, waitHurt = false;	// the combo may still go on (a fireball out, the dummy reeling): hits still count after the end
+	uint32_t hash = 0;
+	std::vector<DnPrHit> hits;
+};
+static DnPrRec gPrRec;
+
+static void DnSetPracticeAll(const std::string& line);
 void DnSetPractice(const std::string& line)
+{
+	if (gMis.on || gPrRec.start >= 0) return;	// a mission's settings are its own; a recording keeps the mark's
+	gPrRec.sets.push_back(std::make_pair(gFrame, line));
+	DnSetPracticeAll(line);
+}
+static void DnSetPracticeAll(const std::string& line)
 {
 	std::vector<int> v;
 	if ((v = DnJsonInts(line, "move")).size() == 1 && v[0] >= MOVE_STAND && v[0] <= MOVE_CROUCH) gPrMove = v[0];
@@ -1734,6 +1784,18 @@ enum { BOX_ATTACK = 1, BOX_HURT = 2, BOX_BALL_ATTACK = 4, BOX_BALL_HURT = 8, BOX
 // the picture for PR_THROW_SHOW pictures, else it would flash for one frame.
 enum { PR_THROW = 0x64, PR_THROW_SHOW = 30 };
 static int gPrThrow[4], gPrThrowLeft = 0;
+// Taken on every frame (DnPracticeBody), not when the picture is drawn: a frame run unseen (a mission's lead-in) writes the same.
+static void DnPracticeThrowTake()
+{
+	for (int p = 0; p < 2; p++) {		// both sides cleared, so a side chosen later shows no old throw
+		const UINT32 b = p ? PR_P2 : PR_P1;
+		int t[4], any = 0;
+		for (int i = 0; i < 4; i++) any |= t[i] = PrWord(b + PR_THROW + i * 2);
+		if (!any) continue;
+		for (int i = 0; i < 4; i++) WriteValueAtHardwareAddress(b + PR_THROW + i * 2, 0, 2, 0);
+		if (b == (gPrBoxSide == 2 ? (UINT32)PR_P2 : (UINT32)PR_P1)) { memcpy(gPrThrow, t, sizeof t); gPrThrowLeft = PR_THROW_SHOW; }
+	}
+}
 static void DnPracticeBoxesOf(UINT8* img, int w, int h, int bpp, int pitch, UINT32 base, bool ball)
 {
 	const int camx = PrWord(PR_CAMERA_X), camy = PrWord(PR_CAMERA_Y);
@@ -1763,20 +1825,14 @@ void DnPracticeOverlay(UINT8* img, int w, int h, int bpp, int pitch)
 		// and the sound: silence, or a loud square wave (750 Hz) while the key was down, so the tool hears when it comes out
 		if (pBurnSoundOut) for (int i = 0; i < nBurnSoundLen; i++) pBurnSoundOut[i * 2] = pBurnSoundOut[i * 2 + 1] = gProbeDown ? ((i / 32) & 1 ? 24000 : -24000) : 0;
 	}
-	if (!gArgs.practice || gArgs.game != "sf2ce" || !img || !PrWord(PR_P2 + PR_HP)) return;
+	// a mission draws nothing on the game (spec §6.3): the recorder's readouts and boxes came along in its settings, kept for the
+	// throw box's memory write (DnPracticeThrowTake), not to be shown
+	if (!gArgs.practice || gMis.on || gArgs.game != "sf2ce" || !img || !PrWord(PR_P2 + PR_HP)) return;
 	if (gPrBoxes) {		// the chosen side's fighter and its fireball
 		const UINT32 base = gPrBoxSide == 2 ? PR_P2 : PR_P1, ball = (UINT32)PrWord(base + PR_BALL);
 		DnPracticeBoxesOf(img, w, h, bpp, pitch, base, false);
 		if (ball) DnPracticeBoxesOf(img, w, h, bpp, pitch, PR_RAM + ball, true);
 		if (gPrBoxes & BOX_THROW) {
-			for (int p = 0; p < 2; p++) {		// both sides cleared, so a side chosen later shows no old throw
-				const UINT32 b = p ? PR_P2 : PR_P1;
-				int t[4], any = 0;
-				for (int i = 0; i < 4; i++) any |= t[i] = PrWord(b + PR_THROW + i * 2);
-				if (!any) continue;
-				for (int i = 0; i < 4; i++) WriteValueAtHardwareAddress(b + PR_THROW + i * 2, 0, 2, 0);
-				if (b == base) { memcpy(gPrThrow, t, sizeof t); gPrThrowLeft = PR_THROW_SHOW; }
-			}
 			if (gPrThrowLeft > 0) {
 				gPrThrowLeft--;
 				const int camx = PrWord(PR_CAMERA_X), camy = PrWord(PR_CAMERA_Y);
@@ -1839,6 +1895,24 @@ static int PrLowAttack(UINT32 base)
 	return -1;
 }
 static int gPrLow = 0;	// the last attack box seen ahead was low: kept through the attack's recovery, so the dummy stays down in its block stun
+static int gPrPhase = 0;	// the reversal's mash, every other frame (a file variable so a mission's start state keeps it: DnPracticeKeep)
+
+// The move that just hit, for missions: the first record of the attacker's animation. Animations are runs of those 24-byte records,
+// the last one marked (bit 7 of +2), so the record after a marked one starts an animation. Read on any frame of an attack it is the
+// same, so an early and a late hit of one move agree, and two moves (strengths, close and far normals) have two animations. A hit
+// while the attacker's own record has no attack box came from its fireball: that object's animation, with DN_MOVE_BALL set.
+enum { DN_MOVE_BALL = 0x1000000, PR_ANIM_BACK = 64 };
+static UINT32 PrAnimStart(UINT32 a)
+{
+	for (int i = 0; i < PR_ANIM_BACK && !(PrByte(a - 24 + 2) & 0x80); i++) a -= 24;
+	return a;
+}
+static int DnMoveId(UINT32 base)
+{
+	const UINT32 anim = (UINT32)PrLong(base + PR_ANIM), ball = (UINT32)PrWord(base + PR_BALL);
+	if (!PrByte(anim + 12) && ball) return DN_MOVE_BALL | (int)PrAnimStart((UINT32)PrLong(PR_RAM + ball + PR_ANIM));
+	return (int)PrAnimStart(anim);
+}
 
 static uint32_t DnPracticeDummy()
 {
@@ -1861,10 +1935,9 @@ static uint32_t DnPracticeDummy()
 				if (gPrStep == 0) {
 			if (kind == REV_CHARGE_DOWN) return R_DOWN;
 		} else if (!free && !gPrFired && s2 != ST_ATTACK && s2 != ST_SPECIAL) {
-			static int phase = 0;
-			phase++;
+			gPrPhase++;
 						if (kind == REV_CHARGE_DOWN) return R_DOWN;
-			if (kind == REV_MASH) return phase & 1 ? buttons : 0;
+			if (kind == REV_MASH) return gPrPhase & 1 ? buttons : 0;
 			return 0;
 		} else {
 			gPrFired++;
@@ -1929,6 +2002,7 @@ static void DnPracticeBody()
 	const bool blocked = s2 == ST_BLOCK || (s2 == ST_HURT && (reaction == RE_STAND_BLOCK || reaction == RE_CROUCH_BLOCK));
 	if (hp2 < gPrLastHp && !blocked) {
 		gPrHits++;
+		gPrHitCount++;
 		gPrDamage += gPrLastHp - hp2;
 		char j[64];
 		sprintf(j, "{\"ev\":\"combo\",\"hits\":%d,\"damage\":%d}", gPrHits, gPrDamage);
@@ -1968,16 +2042,18 @@ static void DnPracticeBody()
 			WriteValueAtHardwareAddress(base + PR_STUN, 0, 1, 0);
 		}
 	}
+	if (gPrBoxes & BOX_THROW) DnPracticeThrowTake();
 }
 
 // The player's own presses for the panel's input list, by role (bit 0 up ... bit 10 fire 6), whenever they change. Start is left out.
+static int gPrLastRoles = -1;	// the last presses told (a mission's reset tells the next ones again: DnPracticePut)
+static bool gPrReleased = false;	// DnPracticeFrame: the first pick's button let go
 static void DnPracticeInput(uint32_t local, int frame)
 {
-	static int last = -1;
 	int roles = 0;
 	for (size_t k = 0; k < gBitRole.size(); k++) if (gBitRole[k] >= 0 && gBitRole[k] != DN_ROLE_START && ((local >> k) & 1)) roles |= 1 << gBitRole[k];
-	if (roles == last) return;
-	last = roles;
+	if (roles == gPrLastRoles) return;
+	gPrLastRoles = roles;
 	char j[64];
 	sprintf(j, "{\"ev\":\"input\",\"f\":%d,\"r\":%d}", frame, roles);
 	DnEmit(j);
@@ -2000,15 +2076,33 @@ static void DnPracticeFrame(uint32_t local, uint32_t* in)
 	in[1] = 0;
 	if (!PrByte(PR_P1 + PR_PICKED)) return;		// the player picks their own fighter, then the other's
 	if (!PrByte(PR_P2 + PR_PICKED)) {
-		static bool released = false;		// the button that picked the first fighter must not pick the second too
-		released = released || !(local & DN_GAME_BITS);
+		gPrReleased = gPrReleased || !(local & DN_GAME_BITS);	// the button that picked the first fighter must not pick the second too
 		in[0] = local & ~(uint32_t)DN_GAME_BITS;
-		if (released) in[1] = local & DN_GAME_BITS;
+		if (gPrReleased) in[1] = local & DN_GAME_BITS;
 		return;
 	}
 	DnPracticeBody();
 	const uint32_t roles = DnPracticeDummy();
 	for (int r = 0; r < DN_ROLES; r++) if ((roles >> r) & 1) in[1] |= gPrBit[r];
+}
+
+// Everything practice keeps from frame to frame that moves the game: a mission's start state is the game's (cbSave) and this.
+struct DnPrRun {
+	int step, quiet, fired, hits, damage, lastHp, lastHp1, settle[2], calm[2], low, phase, move, guard, stun;
+	bool reported, released;
+};
+static void DnPracticeKeep(DnPrRun& r)
+{
+	r.step = gPrStep; r.quiet = gPrQuiet; r.fired = gPrFired; r.hits = gPrHits; r.damage = gPrDamage; r.lastHp = gPrLastHp; r.lastHp1 = gPrLastHp1;
+	memcpy(r.settle, gPrSettle, sizeof r.settle); memcpy(r.calm, gPrCalm, sizeof r.calm);
+	r.low = gPrLow; r.phase = gPrPhase; r.move = gPrMove; r.guard = gPrGuard; r.stun = gPrStun; r.reported = gPrReported; r.released = gPrReleased;
+}
+static void DnPracticePut(const DnPrRun& r)
+{
+	gPrStep = r.step; gPrQuiet = r.quiet; gPrFired = r.fired; gPrHits = r.hits; gPrDamage = r.damage; gPrLastHp = r.lastHp; gPrLastHp1 = r.lastHp1;
+	memcpy(gPrSettle, r.settle, sizeof r.settle); memcpy(gPrCalm, r.calm, sizeof r.calm);
+	gPrLow = r.low; gPrPhase = r.phase; gPrMove = r.move; gPrGuard = r.guard; gPrStun = r.stun; gPrReported = r.reported; gPrReleased = r.released;
+	gPrLastRoles = -1;	// the attempt's first presses are told again
 }
 
 // --script: frame,length,roles;... the player's presses, for tests.
@@ -2060,18 +2154,401 @@ static uint32_t DnScriptInput(const std::string& script, int f)
 	return v;
 }
 
-// dn:practice: a whole session with no window, as fast as it goes: tests script the player and read what happened.
-static int DnPracticeTest(const DnArgs& a)
+// ---------------------------------------------------------------- missions
+// docs/superpowers/specs/2026-11-28-mission-mode-design.md: SF2 Dash practice that opens on a mission. A mission file (.dnm, UTF-8
+// lines) holds the practice settings applied and the player's presses (as roles) from the fast start on. Up to "start" they are the
+// lead-in, run unseen when the mission opens, so the game stands where the recording's mark was; that state is kept once (cbSave and
+// DnPracticeKeep) and every attempt starts from it again. The dummy is practice's own, so the same presses and settings play out the
+// same. Practice only: a match never comes here (DnNetGetInput's practice branch, DnPracticeTest).
+//   dnmission 1 / game sf2ce / set <frame> <practice command> / in <frame> <roles> / start <frame> <hash> / end <frame> /
+//   hit <t> <move> <state> <dx> <stun> (what the recording saw) / goal combo hits=n moves=a|b,c dizzy=0|1 timeout=frames /
+//   goal play move=a|b state=s,s dx=min..max timeout=frames
+static DnPrRun gMisRun;	// the start state's practice side
+// The lead-in runs at most MIS_LEAD_TICK frames a tick (the window keeps answering; ~0.2 s a tick), and is at most an hour long.
+enum { MIS_LEAD_TICK = 600, MIS_LEAD_MAX = 60 * 60 * 60 };
+
+static uint32_t DnRolesToBits(int roles)
 {
-	DnSetPractice(a.practiceSet);
-	DnFastStart();
-	int lastState = -1;
-	for (int f = 0; f < a.frames; f++) {
-		uint32_t local = DnFixDirs(DnScriptInput(a.script, f)), in[GGPO_MAX_PLAYERS] = { 0 };
-		DnPracticeInput(local, f);
-		if (a.game == "sf2ce") DnPracticeFrame(local, in); else in[0] = local;
+	uint32_t bits = 0;
+	for (size_t k = 0; k < gBitRole.size() && k < 32; k++) if (gBitRole[k] >= 0 && ((roles >> gBitRole[k]) & 1)) bits |= 1u << k;
+	return bits;
+}
+struct DnPress { int frame, len, roles; };
+static std::vector<DnPress> DnScriptParse(const std::string& s)	// "frame,length,roles;..." (tests: --try-script)
+{
+	std::vector<DnPress> out;
+	for (size_t at = 0; at < s.size();) {
+		size_t e = s.find(';', at);
+		if (e == std::string::npos) e = s.size();
+		DnPress p;
+		if (sscanf(s.substr(at, e - at).c_str(), "%d,%d,%d", &p.frame, &p.len, &p.roles) == 3) out.push_back(p);
+		at = e + 1;
+	}
+	return out;
+}
+static uint32_t DnScriptAt(const std::vector<DnPress>& ps, int f)
+{
+	int roles = 0;
+	for (size_t i = 0; i < ps.size(); i++) if (f >= ps[i].frame && f < ps[i].frame + ps[i].len) roles |= ps[i].roles;
+	return DnRolesToBits(roles);
+}
+static std::vector<std::string> DnSplit(const std::string& s, char sep)
+{
+	std::vector<std::string> out;
+	for (size_t at = 0; at <= s.size();) {
+		size_t e = s.find(sep, at);
+		if (e == std::string::npos) e = s.size();
+		if (e > at) out.push_back(s.substr(at, e - at));
+		at = e + 1;
+	}
+	return out;
+}
+static std::vector<int> DnSplitInts(const std::string& s, char sep)
+{
+	std::vector<int> out;
+	std::vector<std::string> parts = DnSplit(s, sep);
+	for (size_t i = 0; i < parts.size(); i++) out.push_back((int)strtol(parts[i].c_str(), NULL, 10));
+	return out;
+}
+static void DnGoalParse(const std::string& s, DnMisGoal& g)
+{
+	std::vector<std::string> tok = DnSplit(s, ' ');
+	if (tok.empty()) return;
+	g.kind = tok[0] == "play" ? 1 : 0;
+	for (size_t i = 1; i < tok.size(); i++) {
+		const size_t eq = tok[i].find('=');
+		if (eq == std::string::npos) continue;
+		const std::string k = tok[i].substr(0, eq), v = tok[i].substr(eq + 1);
+		if (k == "hits") g.hits = atoi(v.c_str());
+		else if (k == "dizzy") g.dizzy = atoi(v.c_str());
+		else if (k == "timeout") g.timeout = atoi(v.c_str()) > 0 ? atoi(v.c_str()) : g.timeout;
+		else if (k == "moves") { std::vector<std::string> hits = DnSplit(v, ','); g.moves.clear(); for (size_t h = 0; h < hits.size(); h++) g.moves.push_back(DnSplitInts(hits[h], '|')); }
+		else if (k == "move") { g.moves.clear(); g.moves.push_back(DnSplitInts(v, '|')); }
+		else if (k == "state") g.states = DnSplitInts(v, ',');
+		else if (k == "dx") sscanf(v.c_str(), "%d..%d", &g.dxMin, &g.dxMax);
+	}
+}
+static bool DnMissionParse(const std::string& text, DnMission& m, std::string& err)
+{
+	bool head = false;
+	for (size_t at = 0; at < text.size();) {
+		size_t e = text.find('\n', at);
+		if (e == std::string::npos) e = text.size();
+		std::string l = text.substr(at, e - at);
+		at = e + 1;
+		if (!l.empty() && l[l.size() - 1] == '\r') l.erase(l.size() - 1);
+		if (l.empty()) continue;
+		if (!head) { if (l != "dnmission 1") { err = "not_a_mission"; return false; } head = true; continue; }
+		int f = 0, v = 0;
+		unsigned int h = 0;
+		if (!l.compare(0, 4, "set ")) {
+			const size_t sp = l.find(' ', 4);
+			if (sp == std::string::npos || sscanf(l.c_str() + 4, "%d", &f) != 1) { err = "bad_set"; return false; }
+			m.sets.push_back(std::make_pair(f, l.substr(sp + 1)));
+		}
+		else if (sscanf(l.c_str(), "in %d %d", &f, &v) == 2) m.ins.push_back(std::make_pair(f, v));
+		else if (sscanf(l.c_str(), "start %d %x", &f, &h) == 2) { m.start = f; m.hash = h; }
+		else if (sscanf(l.c_str(), "end %d", &f) == 1) m.end = f;
+		else if (!l.compare(0, 5, "goal ")) DnGoalParse(l.substr(5), m.goal);
+		// "game", "hit" and anything newer: not needed to play it
+	}
+	if (!head) { err = "not_a_mission"; return false; }
+	if (m.start <= 0) { err = "no_start"; return false; }
+	if (m.start > MIS_LEAD_MAX) { err = "too_long"; return false; }
+	return true;
+}
+static void DnMissionDemo(bool on, int speed);
+static void DnMissionOpen(const std::wstring& path, int demo)	// demo: open on the model at that speed (--demo), 0 not
+{
+	std::string text, err;
+	FILE* f = _wfopen(path.c_str(), L"rb");
+	if (f) { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n); fclose(f); }
+	DnMission m;
+	if (!f) err = "cannot_open";
+	else if (DnMissionParse(text, m, err)) { m.on = true; gMis = m; if (demo) DnMissionDemo(true, demo); return; }
+	char j[128];
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"error\",\"err\":\"%s\"}", err.c_str());
+	DnEmit(j);
+}
+static void DnMissionDemo(bool on, int speed)
+{
+	gMis.speed = speed >= 1 && speed <= 10 ? speed : 10;
+	gMis.tick = 0;
+	if (gMis.demo == on) return;
+	gMis.demo = on;
+	gMis.resetPending = true;
+	DnEmit(on ? "{\"ev\":\"mission\",\"op\":\"demo\",\"on\":1}" : "{\"ev\":\"mission\",\"op\":\"demo\",\"on\":0}");
+}
+// Where a mission starts, as a hash (a recording's mark, a mission's ready): the game's work RAM (the 68000's, 0xFF0000-0xFFFFFF).
+// Not cbSave's whole state: with no sound rate (dn:practice, a test or the pack check) the sound chips are never clocked, so the
+// sound CPU and chips differ between a recording made in the window and the same lead-in run headless, while the game is the same.
+static uint32_t DnMissionHash()
+{
+	uint32_t h = 2166136261u;
+	for (UINT32 a = PR_RAM; a < PR_RAM + 0x10000; a += 2) {
+		const int w = PrWord(a);
+		h ^= (uint32_t)(w >> 8) & 0xFF; h *= 16777619u;
+		h ^= (uint32_t)w & 0xFF; h *= 16777619u;
+	}
+	return h;
+}
+static void DnMissionReset()
+{
+	if (gMis.demo && gMis.demoDone) DnMissionDemo(false, 10);	// the model shown once: the player's turn
+	gMis.demoDone = false;
+	cbLoad(gMis.s0.data(), (int)gMis.s0.size());
+	DnPracticePut(gMisRun);
+	gMis.t = 0;
+	gMis.resetPending = false;
+	gMis.seen = gPrHitCount;
+	gMis.hits = gMis.hold = gMis.sinceHit = 0;
+	gMis.ended = gMis.waitHurt = gMis.dizzySeen = false;
+	gMis.lastFree = PrByte(PR_P2 + PR_STATE);
+	bDnSoundJump = true;	// aud_wasapi.cpp: what was playing fades out and the start's sound fades in, no click
+	char j[64];
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"reset\",\"f\":%d}", gFrame);
+	DnEmit(j);
+}
+// First on each tick of a mission, before the attempt's input is read: the lead-in (MIS_LEAD_TICK frames a tick until it is done),
+// or the reset an attempt asked for. false: still in the lead-in, this tick runs no frame of its own.
+static bool DnMissionTick()
+{
+	if (gMis.ready) { if (gMis.resetPending) DnMissionReset(); return true; }
+	for (int k = 0; gFrame < gMis.start; gFrame++, k++) {
+		if (k == MIS_LEAD_TICK) return false;
+		while (gMis.leadSet < gMis.sets.size() && gMis.sets[gMis.leadSet].first <= gFrame) DnSetPracticeAll(gMis.sets[gMis.leadSet++].second);
+		while (gMis.leadIn < gMis.ins.size() && gMis.ins[gMis.leadIn].first <= gFrame) gMis.leadRoles = gMis.ins[gMis.leadIn++].second;
+		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
+		DnPracticeFrame(DnRolesToBits(gMis.leadRoles), in);
 		DnApplyInputs(in);
 		DnStepFrame(false);
+	}
+	while (gMis.leadSet < gMis.sets.size() && gMis.sets[gMis.leadSet].first <= gFrame) DnSetPracticeAll(gMis.sets[gMis.leadSet++].second);	// set on the start frame itself
+	unsigned char* b = NULL;
+	int n = 0, sum = 0;
+	cbSave(&b, &n, &sum, 0);
+	gMis.s0.assign(b, b + n);
+	free(b);
+	DnPracticeKeep(gMisRun);
+	gMis.ready = true;
+	const uint32_t hash = DnMissionHash();
+	char j[128];
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"ready\",\"f\":%d,\"hash\":\"%08x\",\"ok\":%d}", gFrame, (unsigned)hash, hash == gMis.hash ? 1 : 0);
+	DnEmit(j);
+	DnMissionReset();
+	return true;
+}
+// The attempt's verdict (spec §4): told once, then the game runs on for MIS_HOLD frames so the end shows, and starts over.
+enum { MIS_HOLD = 60, MIS_HURT_WAIT = 20 };
+static bool DnHas(const std::vector<int>& v, int x) { for (size_t i = 0; i < v.size(); i++) if (v[i] == x) return true; return false; }
+static void DnMissionEnd(int ok, const char* why, int step)
+{
+	gMis.ended = true;
+	if (gMis.demo) gMis.demoDone = true;
+	gMis.hold = MIS_HOLD - 1;	// frames after this one
+	char j[160];
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"end\",\"ok\":%d,\"hits\":%d,\"step\":%d,\"why\":\"%s\",\"f\":%d%s}", ok, gMis.hits, step, why, gFrame, gMis.demo ? ",\"demo\":1" : "");
+	DnEmit(j);
+}
+// The model's presses on the attempt's frame t: the recording's from its start on, nothing after its end.
+static int DnMissionModelRoles(int t)
+{
+	const int f = gMis.start + t;
+	if (f >= gMis.end) return 0;
+	for (size_t i = gMis.ins.size(); i-- > 0;) if (gMis.ins[i].first <= f) return gMis.ins[i].second;
+	return 0;
+}
+// Each attempt frame, after practice has looked at the frame before (DnPracticeBody counts its hits): a combo is the goal's moves in
+// order, one a hit, while the dummy never gets free between them (spec §4: an input technique done right joins into the combo too);
+// play is the goal's move landing while the dummy was in one of its states, within the distance. Counted on the attempt's own frames.
+static void DnMissionJudge()
+{
+	if (gMis.ended) { if (--gMis.hold <= 0) gMis.resetPending = true; return; }
+	const DnMisGoal& g = gMis.goal;
+	const int s2 = PrByte(PR_P2 + PR_STATE);
+	const bool free2 = s2 == ST_STAND || s2 == ST_CROUCH || s2 == ST_JUMP;
+	if (PrByte(PR_P2 + PR_STUN) >= PR_DIZZY) gMis.dizzySeen = true;
+	while (gMis.seen < gPrHitCount) {
+		gMis.seen++;
+		const int mv = DnMoveId(PR_P1), k = gMis.hits++;
+		char j[128];
+		sprintf(j, "{\"ev\":\"mission\",\"op\":\"hit\",\"n\":%d,\"move\":%d,\"t\":%d}", gMis.hits, mv, gMis.t);
+		DnEmit(j);
+		if (g.kind == 1) {
+			const int dx = abs(PrWord(PR_P2 + PR_X) - PrWord(PR_P1 + PR_X));
+			const bool ok = !g.moves.empty() && DnHas(g.moves[0], mv) && (g.states.empty() || DnHas(g.states, gMis.lastFree)) && dx >= g.dxMin && dx <= g.dxMax;
+			DnMissionEnd(ok, ok ? "" : "wrong", 1);
+			return;
+		}
+		if (k < (int)g.moves.size() && !DnHas(g.moves[k], mv)) { DnMissionEnd(0, "wrong", k + 1); return; }
+		gMis.waitHurt = true;
+		gMis.sinceHit = 0;
+	}
+	if (g.kind == 0 && gMis.hits >= g.hits && g.hits > 0 && (!g.dizzy || gMis.dizzySeen)) { DnMissionEnd(1, "", gMis.hits); return; }
+	if (g.kind == 0 && gMis.hits > 0) {
+		bool over = false;
+		if (gMis.waitHurt) { if (!free2) gMis.waitHurt = false; else if (++gMis.sinceHit > MIS_HURT_WAIT) over = true; }
+		else if (free2) over = true;
+		if (over) { DnMissionEnd(0, gMis.hits >= g.hits ? "dizzy" : "drop", gMis.hits >= g.hits ? gMis.hits : gMis.hits + 1); return; }
+	}
+	if (gMis.t >= g.timeout) { DnMissionEnd(0, "time", gMis.hits + 1); return; }
+	if (s2 != ST_HURT && s2 != ST_THROWN) gMis.lastFree = s2;
+}
+// One frame of an attempt: the input it plays (in), 0; or 1 when this tick runs no frame (the model slowed down, as a replay is).
+// Start (pressed, not held) starts the attempt over on the next tick and never reaches the game; during the model, it skips to the
+// player's turn. The model plays the recording's presses; it is judged as an attempt is, so the steps light up as it goes.
+static int DnMissionStep(uint32_t local, uint32_t* in)
+{
+	if (gMis.demo && gMis.speed < 10 && (gMis.tick++ % (10 / gMis.speed))) return 1;
+	const uint32_t start = DnRolesToBits(1 << DN_ROLE_START);
+	const bool startDown = (local & start) != 0, pressed = startDown && !gMis.startHeld;
+	gMis.startHeld = startDown;
+	if (pressed) { if (gMis.demo) DnMissionDemo(false, 10); else gMis.resetPending = true; }
+	local = gMis.demo ? DnRolesToBits(DnMissionModelRoles(gMis.t)) : local & ~start;
+	DnPracticeInput(local, gFrame);
+	DnPracticeFrame(local, in);
+	if (!gMis.resetPending) DnMissionJudge();
+	gMis.t++;
+	return 0;
+}
+
+// Recording (gPrRec, practice without a mission): each practice frame's presses as roles (start too) when they change, and from the
+// mark on what each hit was, for the mission's goal (written as hit lines: the frame from the mark, the move, the dummy's state
+// before it, the distance, its stun).
+static void DnRecordPractice(uint32_t local)
+{
+	int roles = 0;
+	for (size_t k = 0; k < gBitRole.size() && k < 32; k++) if (gBitRole[k] >= 0 && ((local >> k) & 1)) roles |= 1 << gBitRole[k];
+	if (roles != gPrRec.lastRoles) { gPrRec.lastRoles = roles; gPrRec.ins.push_back(std::make_pair(gFrame, roles)); }
+	// hits from the mark on, and after the end while the combo may still go on (a fireball thrown before the end lands after it)
+	if (gPrRec.start < 0 || (gPrRec.end >= 0 && !gPrRec.busy)) return;
+	while (gPrRec.seen < gPrHitCount) {
+		gPrRec.seen++;
+		const DnPrHit h = { gFrame - gPrRec.start, DnMoveId(PR_P1), gPrRec.lastFree, abs(PrWord(PR_P2 + PR_X) - PrWord(PR_P1 + PR_X)), PrByte(PR_P2 + PR_STUN) };
+		gPrRec.hits.push_back(h);
+		gPrRec.waitHurt = true;
+		gPrRec.since = 0;
+	}
+	const int s2 = PrByte(PR_P2 + PR_STATE);
+	const bool free2 = s2 == ST_STAND || s2 == ST_CROUCH || s2 == ST_JUMP;
+	if (gPrRec.waitHurt && (!free2 || ++gPrRec.since > MIS_HURT_WAIT)) gPrRec.waitHurt = false;	// as the judge waits for a hit to make it reel
+	gPrRec.busy = PrWord(PR_P1 + PR_BALL) != 0 || gPrRec.waitHurt || !free2;
+	if (s2 != ST_HURT && s2 != ST_THROWN) gPrRec.lastFree = s2;
+}
+// The mark: the mission starts here (the state before this frame runs, as a mission's start state is kept after its lead-in).
+static void DnRecMark()
+{
+	gPrRec.start = gFrame;
+	gPrRec.end = -1;
+	gPrRec.hash = DnMissionHash();
+	gPrRec.seen = gPrHitCount;
+	gPrRec.hits.clear();
+	gPrRec.busy = gPrRec.waitHurt = false;
+	gPrRec.lastFree = PrByte(PR_P2 + PR_STATE);
+	char j[96];		// p1, p2: the fighters (PR_FIGHTER, 0 Ryu .. 11), which the lobby names the mission by
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"marked\",\"f\":%d,\"p1\":%d,\"p2\":%d}", gFrame, PrByte(PR_P1 + PR_FIGHTER), PrByte(PR_P2 + PR_FIGHTER));
+	DnEmit(j);
+}
+static void DnRecSave(const std::wstring& path)
+{
+	if (gPrRec.start < 0) { DnEmit("{\"ev\":\"mission\",\"op\":\"saved\",\"err\":\"no_mark\"}"); return; }
+	const int start = gPrRec.start, end = gPrRec.end >= 0 ? gPrRec.end : gFrame;
+	FILE* f = _wfopen(path.c_str(), L"wb");
+	if (!f) { DnEmit("{\"ev\":\"mission\",\"op\":\"saved\",\"err\":\"cannot_write\"}"); return; }
+	fprintf(f, "dnmission 1\ngame sf2ce\n");
+	for (size_t i = 0; i < gPrRec.sets.size() && gPrRec.sets[i].first <= start; i++) fprintf(f, "set %d %s\n", gPrRec.sets[i].first, gPrRec.sets[i].second.c_str());
+	for (size_t i = 0; i < gPrRec.ins.size() && gPrRec.ins[i].first < end; i++) fprintf(f, "in %d %d\n", gPrRec.ins[i].first, gPrRec.ins[i].second);
+	fprintf(f, "start %d %08x\nend %d\n", start, (unsigned)gPrRec.hash, end);
+	const int hits = (int)gPrRec.hits.size();	// the end's combo too, as far as it has gone (busy: it might still go on)
+	for (int i = 0; i < hits; i++) {
+		const DnPrHit& h = gPrRec.hits[i];
+		fprintf(f, "hit %d %d %d %d %d\n", h.t, h.move, h.state, h.dx, h.stun);
+	}
+	fclose(f);
+	char j[160];	// lead: the lead-in's frames (a mission opens in about lead / 3000 s); busy: saved while a fireball or a combo was still going
+	sprintf(j, "{\"ev\":\"mission\",\"op\":\"saved\",\"start\":%d,\"end\":%d,\"hits\":%d,\"lead\":%d%s}", start, end, hits, start, gPrRec.end >= 0 && gPrRec.busy ? ",\"busy\":1" : "");
+	DnEmit(j);
+	gPrRec.start = gPrRec.end = -1;
+	gPrRec.hits.clear();
+}
+// "path":"..." from a lobby command: JSON.stringify escapes only \ and " in a Windows path (Korean stays as UTF-8).
+static std::wstring DnJsonPath(const std::string& line)
+{
+	const size_t k = line.find("\"path\":\"");
+	if (k == std::string::npos) return L"";
+	std::string s;
+	for (size_t i = k + 8; i < line.size() && line[i] != '"'; i++) {
+		if (line[i] == '\\' && i + 1 < line.size()) i++;
+		s += line[i];
+	}
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
+	std::wstring w(n > 1 ? n - 1 : 0, L'\0');
+	if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+	return w;
+}
+
+// {"cmd":"mission","op":...} from the lobby: demo (speed 2, 5 or 10: the model from the start, then the player's turn), try (the
+// player's turn now), reset; and in practice without a mission, recording one: mark, end (the model's end), save ("path").
+void DnMissionCmd(const std::string& line)
+{
+	if (!gMis.on) {
+		if (!gArgs.practice || gArgs.game != "sf2ce") return;
+		if (line.find("\"op\":\"mark\"") != std::string::npos) DnRecMark();
+		else if (line.find("\"op\":\"end\"") != std::string::npos) { if (gPrRec.start >= 0) gPrRec.end = gFrame; }
+		else if (line.find("\"op\":\"save\"") != std::string::npos) DnRecSave(DnJsonPath(line));
+		return;
+	}
+	if (line.find("\"op\":\"demo\"") != std::string::npos) {
+		const std::vector<int> v = DnJsonInts(line, "speed");
+		DnMissionDemo(true, v.size() == 1 ? v[0] : 10);
+	}
+	else if (line.find("\"op\":\"try\"") != std::string::npos) { DnMissionDemo(false, 10); gMis.resetPending = true; }
+	else if (line.find("\"op\":\"reset\"") != std::string::npos) gMis.resetPending = true;
+}
+
+// dn:practice: a whole session with no window, as fast as it goes: tests script the player and read what happened. A mission's
+// ticks take each attempt's presses from --try-script, counted from the attempt's start.
+static int DnPracticeTest(const DnArgs& a)
+{
+	if (a.game == "sf2ce" && !a.mission.empty()) DnMissionOpen(a.mission, a.demo);
+	DnSetPractice(a.practiceSet);
+	DnFastStart();
+	const std::vector<DnPress> tries = DnScriptParse(a.tryScript);
+	int setAt = -1;		// --practice-at <frame>:<settings>: a practice command at that frame, as the panel would send it
+	std::string setLine;
+	if (!a.practiceAt.empty() && sscanf(a.practiceAt.c_str(), "%d:", &setAt) == 1) setLine = "{\"cmd\":\"practice\"," + a.practiceAt.substr(a.practiceAt.find(':') + 1) + "}";
+	int cmdAt = -1;		// --mission-at <frame>:<body>: a mission command at that frame, as the lobby's pipe brings it
+	std::string cmdLine;
+	if (!a.missionAt.empty() && sscanf(a.missionAt.c_str(), "%d:", &cmdAt) == 1) cmdLine = "{\"cmd\":\"mission\"," + a.missionAt.substr(a.missionAt.find(':') + 1) + "}";
+	int lastState = -1;
+	for (int tick = 0; tick < a.frames; tick++) {
+		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
+		if (gFrame == cmdAt) { DnMissionCmd(cmdLine); cmdAt = -1; }
+		if (gMis.on) {
+			if (!DnMissionTick()) continue;
+			if (DnMissionStep(DnScriptAt(tries, gMis.t), in)) continue;
+		} else {
+			const int f = gFrame;
+			if (f == setAt) DnSetPractice(setLine);
+			if (f == a.recMark && a.game == "sf2ce") DnRecMark();
+			uint32_t local = DnFixDirs(DnScriptInput(a.script, f));
+			DnPracticeInput(local, f);
+			const int hitsBefore = gPrHitCount;
+			if (a.game == "sf2ce") { DnPracticeFrame(local, in); DnRecordPractice(local); } else in[0] = local;
+			if (a.game == "sf2ce") {	// tests: the move each hit was, and what an attack reads as on each of its active frames
+				char e[80];
+				if (gPrHitCount > hitsBefore) { sprintf(e, "{\"ev\":\"hitmove\",\"f\":%d,\"move\":%d,\"hits\":%d}", f, DnMoveId(PR_P1), gPrHits); DnEmit(e); }
+				static int lastMove = 0;
+				const int s1 = PrByte(PR_P1 + PR_STATE);
+				const bool active = (s1 == ST_ATTACK || s1 == ST_SPECIAL) && PrByte((UINT32)PrLong(PR_P1 + PR_ANIM) + 12);
+				const int mv = active ? DnMoveId(PR_P1) : 0;
+				if (mv != lastMove) { lastMove = mv; sprintf(e, "{\"ev\":\"move\",\"f\":%d,\"move\":%d}", f, mv); DnEmit(e); }
+			}
+		}
+		const int f = gFrame;
+		DnApplyInputs(in);
+		DnStepFrame(false);
+		gFrame++;
 		if (a.game != "sf2ce") continue;
 		static FILE* dump = a.dump.empty() ? NULL : _wfopen(a.dump.c_str(), L"wb");
 		if (dump) {		// both fighters, every frame, for tests that compare runs
@@ -2093,6 +2570,7 @@ static int DnPracticeTest(const DnArgs& a)
 	}
 	char j[120];
 	if (a.game != "sf2ce") return 0;
+	if (!a.recSave.empty() && !gMis.on) DnRecSave(a.recSave);
 	sprintf(j, "{\"ev\":\"practice-end\",\"p1\":%d,\"p2\":%d,\"s\":%d,\"x\":%d,\"hp\":%d,\"bar\":%d,\"time\":%d}", PrByte(PR_P1 + PR_FIGHTER), PrByte(PR_P2 + PR_FIGHTER), PrByte(PR_P2 + PR_STATE), PrWord(PR_P2 + PR_X) - PrWord(PR_P1 + PR_X), PrWord(PR_P2 + PR_HP), PrByte(PR_P2 + PR_HP_BAR), PrByte(PR_TIMER));
 	DnEmit(j);
 	return 0;
@@ -2142,10 +2620,16 @@ int DnNetGetInput()
 	local = DnWithSeatRequest(local);
 	if (probeKey && !gAlone) local |= 1u << DN_BIT_PROBE;
 	{ static bool was = false; if (gArgs.latencyProbe && probeKey != was) { was = probeKey; DnFrameLog(probeKey ? 'K' : 'k'); } }	// tests: when it was read
-	if (gArgs.practice) DnPracticeInput(local, gFrame);
+	if (gArgs.practice && !gMis.on) DnPracticeInput(local, gFrame);	// a mission tells the presses it plays itself (the model's, in a demo)
 	if (gArgs.practice && gArgs.game == "sf2ce") {
 		uint32_t in[GGPO_MAX_PLAYERS] = { 0 };
+		if (gMis.on) {
+			if (!DnMissionTick() || DnMissionStep(local, in)) return 1;	// still in the lead-in, or the model slowed down
+			DnApplyInputs(in);
+			return 0;
+		}
 		DnPracticeFrame(local, in);
+		DnRecordPractice(local);	// kept for a mission recording (gPrRec)
 		DnApplyInputs(in);
 		return 0;
 	}

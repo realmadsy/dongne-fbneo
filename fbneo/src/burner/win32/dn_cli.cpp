@@ -10,6 +10,14 @@ static std::string Narrow(const wchar_t* s)
 	return r;
 }
 
+static std::string Utf8(const wchar_t* s)	// as the lobby's pipe carries text (a Korean path stays whole)
+{
+	const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
+	std::string r(n > 1 ? n - 1 : 0, '\0');
+	if (n > 1) WideCharToMultiByte(CP_UTF8, 0, s, -1, &r[0], n, NULL, NULL);
+	return r;
+}
+
 static bool ParseUInt(const wchar_t* s, unsigned long long lo, unsigned long long hi, unsigned long long& out, int base = 10)
 {
 	if (!*s) return false;
@@ -103,6 +111,13 @@ bool DnParseArgs(const wchar_t* cmdline, DnArgs& a, std::string& err)
 		else if (k == L"--aud-segs") { ok = ParseUInt(v, 2, 16, u); a.audSegs = (int)u; }
 		else if (k == L"--practice-set") a.practiceSet = Narrow(v);
 		else if (k == L"--script") a.script = Narrow(v);
+		else if (k == L"--mission") a.mission = v;
+		else if (k == L"--try-script") a.tryScript = Narrow(v);
+		else if (k == L"--demo") ok = ParseInt(v, 1, 10, a.demo);
+		else if (k == L"--rec-mark") ok = ParseInt(v, 0, 100000000, a.recMark);
+		else if (k == L"--rec-save") a.recSave = v;
+		else if (k == L"--practice-at") a.practiceAt = Narrow(v);
+		else if (k == L"--mission-at") a.missionAt = Utf8(v);
 		else if (k == L"--script-file") {		// tests: a script longer than FBNeo's command line takes
 			FILE* f = _wfopen(v, L"rb");
 			ok = f != NULL;

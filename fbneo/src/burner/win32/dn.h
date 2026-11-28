@@ -33,6 +33,13 @@ struct DnArgs {
 	bool practice = false;	// --practice 1: alone, no session; SF2 Dash's other fighter follows the panel, KOF '98 opens its own practice mode
 	std::string practiceSet;	// --practice-set: the settings to start with, as in the "practice" command
 	std::string script;		// --script (dn:practice): frame,length,roles;... the player's presses, for tests
+	std::wstring mission;	// --mission <file>: practice opens on a mission (a recording's lead-in run unseen, then attempts from its start; dn_netplay.cpp "missions")
+	std::string tryScript;	// --try-script (dn:practice): frame,length,roles;... each attempt's presses, the frames counted from the attempt's start (tests)
+	int demo = 0;			// --demo <speed>: a mission opens on its model, at speed tenths (2, 5, 10), as {"cmd":"mission","op":"demo"} does
+	int recMark = -1;		// --rec-mark <frame> (dn:practice): a recording's mark at that frame, as {"cmd":"mission","op":"mark"} does (tests)
+	std::wstring recSave;	// --rec-save <file> (dn:practice): the recording saved there at the end (tests)
+	std::string practiceAt;	// --practice-at <frame>:<settings> (dn:practice): a practice command at that frame, e.g. 1340:"move":0 (tests)
+	std::string missionAt;	// --mission-at <frame>:<body> (dn:practice): {"cmd":"mission",<body>} at that frame, as the lobby sends it (tests)
 	std::vector<int> seats;	// --seats 2,1: the player number of each room player (room order) to start with; default 1, 2, ...
 	bool runAhead = false;		// --runahead 1: show the frame after the real one (this player's screen only)
 	int romTextFix = 2;	// --rom-text-fix N: a driver's fixes to a game's on-screen text up to level N only (a replay recorded before the later ones: its state checks still match); 1 the 3:3 ORDER SELECT, 2 its bosses' world names
@@ -81,6 +88,7 @@ void DnWatchFeed(const std::string& line);	// {"cmd":"feed","from":f,"d":"n:w.w,
 void DnSetVolume(const std::string& line);	// {"cmd":"volume","v":0-100}: the game's sound, from the lobby's slider
 void DnSetSeat(const std::string& line);	// {"cmd":"seat","to":3}: move to that player number if nobody holds it
 void DnSetPractice(const std::string& line);	// {"cmd":"practice","move":0,"guard":0,"stun":1}
+void DnMissionCmd(const std::string& line);	// {"cmd":"mission","op":"demo"|"try"|"reset"|"mark"|"end"|"save",...}: a mission's controls, and recording one (dn_netplay.cpp "missions")
 void DnSetHotkeys(const std::string& line);	// {"cmd":"hotkeys","hk":[code,mask,turbo,...]}: mask bit 0 = fire 1, turbo = period in frames or 0
 
 // dn:p2p runs inside FBNeo's normal app + message loop (main.cpp / run.cpp hooks)
