@@ -1269,6 +1269,32 @@ int DnRun(const DnArgs& a)
 // ---------------------------------------------------------------- dn:p2p
 
 bool bDnNet = false;
+// The game thread stuck for good (2026-11-28: after another program's admin prompt, DirectDraw waited in the graphics driver
+// forever, and the lobby froze with it, its window being our window's parent): when the message loop has not turned for
+// 30 s of awake time (sleep and hibernation not counted), say so and end, so the lobby comes back. It starts counting at the
+// loop's first turn: loading and the port wait come before.
+// ponytail: 30 s, a guess above DX9 Alt's own recovery after such a prompt (about 18 s measured); per-step stalls if needed.
+volatile LONG gDnLoopTurns = 0;
+enum { DN_HANG_MS = 30000 };
+static DWORD WINAPI DnHangWatch(LPVOID)
+{
+	while (gDnLoopTurns == 0) Sleep(200);
+	LONG last = gDnLoopTurns;
+	ULONGLONG since;
+	QueryUnbiasedInterruptTime(&since);
+	for (;;) {
+		Sleep(500);
+		ULONGLONG now;
+		QueryUnbiasedInterruptTime(&now);
+		const LONG turns = gDnLoopTurns;
+		if (turns != last) { last = turns; since = now; continue; }
+		if ((now - since) / 10000 >= DN_HANG_MS) {
+			DnEmitError("hang", "the game stopped for 30 s");
+			DnEmitDrain(1000);
+			TerminateProcess(GetCurrentProcess(), DN_EXIT_HANG);
+		}
+	}
+}
 static int gExitCode = DN_EXIT_OK;
 static GGPOPlayerHandle gHandle[GGPO_MAX_PLAYERS];
 static GGPOPlayerHandle gLocal;
@@ -1376,6 +1402,7 @@ static bool DnPortFree(int port)
 int DnP2PLoad()
 {
 	DnIpcStart(gArgs.parent);	// before the screen window exists, so ScrnInit() sees the parent
+	CloseHandle(CreateThread(NULL, 0, DnHangWatch, NULL, 0, NULL));
 	bNoPopups = true;
 	bQuietLoading = true;
 	bRunAhead = 0;			// its own save/load would fight the rollback
@@ -1390,6 +1417,11 @@ int DnP2PLoad()
 	// MediaInit() falls back to DirectSound if WASAPI can't start. Before the game loads: its sound chips are set up for
 	// this rate, and running them at another one writes past their buffers. One fixed rate, whatever the settings file
 	// or the fallback, because the rate is part of what rollback saves: every peer needs the same one.
+	// The picture through DX9 Alt (owner 2026-11-28), not DirectDraw: after another program's admin prompt DirectDraw waited in
+	// the NVIDIA driver forever (IsLost), DX9 Alt came back by itself. The same latency and frame pacing (docs/latency.md
+	// 2026-11-25); point filtering keeps the pixels sharp, as DirectDraw drew them and as Fightcade sets it. Only d3d9.dll.
+	nVidSelect = 4;
+	bVidDX9Bilinear = 0;
 	if (gArgs.vidSelect >= 0) nVidSelect = (UINT32)gArgs.vidSelect;	// tests (tools/latency)
 	if (gArgs.dwmSync >= 0) bVidDWMSync = gArgs.dwmSync != 0;
 	nAudSelect = 2;

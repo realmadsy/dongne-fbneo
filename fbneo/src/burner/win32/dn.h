@@ -92,4 +92,5 @@ void DnFrameLog(char kind);	// RunFrame(): after painting
 void DnNetIdle();			// RunIdle(): network poll, rollbacks, stats
 int DnShutdown();			// end of WinMain: closes the session, returns the exit code
 
-enum { DN_EXIT_OK = 0, DN_EXIT_DESYNC = 2, DN_EXIT_ROM = 3, DN_EXIT_PORT = 4, DN_EXIT_OTHER = 5 };
+enum { DN_EXIT_OK = 0, DN_EXIT_DESYNC = 2, DN_EXIT_ROM = 3, DN_EXIT_PORT = 4, DN_EXIT_OTHER = 5, DN_EXIT_HANG = 6 };
+extern volatile LONG gDnLoopTurns;	// run.cpp: the message loop's turns, for the hang watch (dn_netplay.cpp DnHangWatch)

@@ -1,5 +1,6 @@
 // Media module
 #include "burner.h"
+extern bool bDnNet;	// dn_netplay.cpp
 
 int MediaInit()
 {
@@ -41,6 +42,10 @@ int MediaInit()
 
 		// Reinit the video plugin
 		VidInit();
+		if (!bVidOkay && bDnNet && nVidSelect != 2) {	// dn: DX9 Alt could not start here (no 3D device): DirectDraw, as before 2026-11-28
+			nVidSelect = 2;
+			VidInit();
+		}
 		if (!bVidOkay && nVidFullscreen) {
 
 			nVidFullscreen = 0;

@@ -900,6 +900,7 @@ int RunMessageLoop()
 				VidSAddChatMsg(szTemp1, 0xFFFFFF, szTemp2, 0xFFBFBF);
 			}
 
+			gDnLoopTurns++;												// dn: still turning (the hang watch, dn_netplay.cpp)
 			if (PeekMessage(&Msg, NULL, 0, 0, PM_REMOVE)) {
 				// A message is waiting to be processed
 				if (Msg.message == WM_QUIT)	{											// Quit program
